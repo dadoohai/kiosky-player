@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+media_cache/
+logs/
+runtime/
+config.json

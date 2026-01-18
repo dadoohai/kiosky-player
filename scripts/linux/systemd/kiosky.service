@@ -1,0 +1,14 @@
+[Unit]
+Description=Kiosky MPV Player
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/kioskyLocal
+ExecStart=/path/to/kioskyLocal/.venv/bin/python /path/to/kioskyLocal/kiosk.py --config /path/to/kioskyLocal/config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
