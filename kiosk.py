@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import calendar
 import hashlib
 import json
 import logging
@@ -42,6 +43,13 @@ DEFAULT_CONFIG = {
     "request_timeout_sec": 15,
     "default_duration_ms": 10000,
     "cache_dir": "./media_cache",
+    "state_dir": "",
+    "offline_fallback": True,
+    "offline_max_age_hours": 0,
+    "require_full_download_before_switch": True,
+    "disable_cleanup_when_offline": True,
+    "cache_max_files": 0,
+    "cache_max_bytes": 0,
     "mpv_path": "mpv",
     "ipc_path": default_ipc_path(),
     "rotation_deg": 0,
@@ -85,6 +93,7 @@ class PlaylistState:
         self._items: List[MediaItem] = []
         self._version = 0
         self._fingerprint = ""
+        self._items_signature = ""
 
     def get(self) -> Tuple[List[MediaItem], int]:
         with self._lock:
@@ -92,11 +101,13 @@ class PlaylistState:
 
     def update(self, items: List[MediaItem], fingerprint: str) -> bool:
         with self._lock:
-            if fingerprint == self._fingerprint:
+            signature = items_signature(items)
+            if fingerprint == self._fingerprint and signature == self._items_signature:
                 return False
             self._items = list(items)
             self._version += 1
             self._fingerprint = fingerprint
+            self._items_signature = signature
             return True
 
 
@@ -136,6 +147,159 @@ def setup_logging(cfg: Dict) -> None:
 
 def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def parse_iso_utc(value: str) -> Optional[int]:
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return None
+
+
+def state_dir(cfg: Dict) -> str:
+    configured = cfg.get("state_dir")
+    if configured:
+        return configured
+    cache_dir = cfg.get("cache_dir") or "."
+    return os.path.join(cache_dir, ".state")
+
+
+def state_path(cfg: Dict, filename: str) -> str:
+    return os.path.join(state_dir(cfg), filename)
+
+
+def load_json_file(path: str) -> Optional[Dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logging.warning("Failed to read state file %s: %s", path, exc)
+        return None
+
+
+def write_json_file(path: str, data: Dict, ensure_ascii: bool = True) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=ensure_ascii)
+    os.replace(tmp_path, path)
+
+
+def playlist_state_path(cfg: Dict) -> str:
+    return state_path(cfg, "playlist_last.json")
+
+
+def cache_index_path(cfg: Dict) -> str:
+    return state_path(cfg, "cache_index.json")
+
+
+def last_success_path(cfg: Dict) -> str:
+    return state_path(cfg, "last_success.json")
+
+
+def save_last_success(cfg: Dict, timestamp: str) -> None:
+    payload = {"last_success": timestamp}
+    write_json_file(last_success_path(cfg), payload, ensure_ascii=True)
+
+
+def load_last_success(cfg: Dict) -> Optional[str]:
+    data = load_json_file(last_success_path(cfg))
+    if not data:
+        return None
+    value = data.get("last_success")
+    return value if isinstance(value, str) else None
+
+
+def save_playlist_state(cfg: Dict, items: List["MediaItem"], fingerprint: str) -> None:
+    payload = {
+        "version": 1,
+        "saved_at": iso_now(),
+        "fingerprint": fingerprint,
+        "playlist": [
+            {
+                "url": item.url,
+                "duration_ms": item.duration_ms,
+                "campaign_id": item.campaign_id,
+                "campaign_name": item.campaign_name,
+            }
+            for item in items
+        ],
+    }
+    write_json_file(playlist_state_path(cfg), payload, ensure_ascii=False)
+
+
+def load_playlist_state(cfg: Dict) -> Tuple[List[Dict], Optional[str], Optional[str]]:
+    data = load_json_file(playlist_state_path(cfg))
+    if not data:
+        return [], None, None
+    raw_items = data.get("playlist") or []
+    fingerprint = data.get("fingerprint")
+    saved_at = data.get("saved_at")
+    if not isinstance(raw_items, list):
+        return [], None, None
+    return raw_items, fingerprint if isinstance(fingerprint, str) else None, saved_at if isinstance(saved_at, str) else None
+
+
+def saved_playlist_paths(cfg: Dict) -> set:
+    raw_items, _fingerprint, _saved_at = load_playlist_state(cfg)
+    keep_paths: set = set()
+    cache_dir = cfg.get("cache_dir") or "."
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not url:
+            continue
+        path = cache_path(cache_dir, url)
+        if os.path.exists(path):
+            keep_paths.add(path)
+    return keep_paths
+
+
+def media_items_from_saved(cfg: Dict, raw_items: List[Dict]) -> Tuple[List["MediaItem"], List[Dict]]:
+    items: List[MediaItem] = []
+    fingerprint_items_payload: List[Dict] = []
+    cache_dir = cfg.get("cache_dir") or "."
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not url:
+            continue
+        try:
+            duration_ms = int(item.get("duration_ms") or cfg.get("default_duration_ms") or 0)
+        except Exception:
+            duration_ms = int(cfg.get("default_duration_ms") or 0)
+        path = cache_path(cache_dir, url)
+        if not os.path.exists(path):
+            continue
+        items.append(
+            MediaItem(
+                url=str(url),
+                duration_ms=duration_ms,
+                path=path,
+                campaign_id=str(item.get("campaign_id", "")),
+                campaign_name=str(item.get("campaign_name", "")),
+            )
+        )
+        fingerprint_items_payload.append({"url": str(url), "duration_ms": duration_ms})
+    return items, fingerprint_items_payload
+
+
+def offline_playlist_allowed(cfg: Dict, saved_at: Optional[str]) -> bool:
+    max_age_hours = float(cfg.get("offline_max_age_hours") or 0)
+    if max_age_hours <= 0:
+        return True
+    ref = load_last_success(cfg) or saved_at
+    if not ref:
+        return True
+    ref_ts = parse_iso_utc(ref)
+    if ref_ts is None:
+        return True
+    age_hours = (time.time() - ref_ts) / 3600.0
+    return age_hours <= max_age_hours
 
 
 def config_snapshot(cfg: Dict, lock: threading.Lock) -> Dict:
@@ -278,6 +442,83 @@ class StatusState:
             return dict(self._data)
 
 
+def safe_getsize(path: str) -> Optional[int]:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+class CacheIndex:
+    def __init__(self, cfg: Dict) -> None:
+        self._path = cache_index_path(cfg)
+        self._lock = threading.Lock()
+        self._items: Dict[str, Dict[str, object]] = {}
+        self._last_save = 0.0
+        self._save_interval = 5.0
+        self._load()
+
+    def _load(self) -> None:
+        data = load_json_file(self._path) or {}
+        items = data.get("items")
+        if isinstance(items, dict):
+            self._items = {k: v for k, v in items.items() if isinstance(v, dict)}
+
+    def _save(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_save < self._save_interval:
+            return
+        payload = {
+            "version": 1,
+            "updated_at": iso_now(),
+            "items": self._items,
+        }
+        write_json_file(self._path, payload, ensure_ascii=False)
+        self._last_save = now
+
+    def record_download(self, item: MediaItem) -> None:
+        with self._lock:
+            meta = dict(self._items.get(item.path, {}))
+            meta.update(
+                {
+                    "url": item.url,
+                    "campaign_id": item.campaign_id,
+                    "campaign_name": item.campaign_name,
+                    "last_used": iso_now(),
+                    "size": safe_getsize(item.path) or meta.get("size"),
+                }
+            )
+            self._items[item.path] = meta
+            self._save()
+
+    def touch(self, item: MediaItem) -> None:
+        with self._lock:
+            meta = dict(self._items.get(item.path, {}))
+            meta.update(
+                {
+                    "url": item.url,
+                    "campaign_id": item.campaign_id,
+                    "campaign_name": item.campaign_name,
+                    "last_used": iso_now(),
+                    "size": safe_getsize(item.path) or meta.get("size"),
+                }
+            )
+            self._items[item.path] = meta
+            self._save()
+
+    def remove_missing(self) -> None:
+        with self._lock:
+            missing = [path for path in self._items if not os.path.exists(path)]
+            if not missing:
+                return
+            for path in missing:
+                self._items.pop(path, None)
+            self._save(force=True)
+
+    def snapshot(self) -> Dict[str, Dict[str, object]]:
+        with self._lock:
+            return dict(self._items)
+
 def sha1_hex(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()
 
@@ -336,7 +577,7 @@ def fetch_media_list(cfg: Dict) -> List[Dict]:
     return items
 
 
-def download_media(cfg: Dict, raw_items: List[Dict]) -> List[MediaItem]:
+def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[CacheIndex]) -> List[MediaItem]:
     os.makedirs(cfg["cache_dir"], exist_ok=True)
     items: List[MediaItem] = []
 
@@ -361,20 +602,26 @@ def download_media(cfg: Dict, raw_items: List[Dict]) -> List[MediaItem]:
                 else:
                     continue
 
-        items.append(
-            MediaItem(
-                url=url,
-                duration_ms=int(item["duration_ms"]),
-                path=dest,
-                campaign_id=item.get("campaign_id", ""),
-                campaign_name=item.get("campaign_name", ""),
-            )
+        media_item = MediaItem(
+            url=url,
+            duration_ms=int(item["duration_ms"]),
+            path=dest,
+            campaign_id=item.get("campaign_id", ""),
+            campaign_name=item.get("campaign_name", ""),
         )
+        items.append(media_item)
+        if cache_index is not None:
+            cache_index.record_download(media_item)
     return items
 
 
 def fingerprint_items(raw_items: List[Dict]) -> str:
     payload = [{"url": i["url"], "duration_ms": i["duration_ms"]} for i in raw_items]
+    return sha1_hex(json.dumps(payload, sort_keys=True))
+
+
+def items_signature(items: List[MediaItem]) -> str:
+    payload = [{"path": i.path, "duration_ms": i.duration_ms} for i in items]
     return sha1_hex(json.dumps(payload, sort_keys=True))
 
 
@@ -707,6 +954,7 @@ def poller(
     poll_now_event: threading.Event,
     state: PlaylistState,
     status: StatusState,
+    cache_index: CacheIndex,
     stop_event: threading.Event,
 ) -> None:
     backoff = 2
@@ -716,30 +964,53 @@ def poller(
         try:
             raw_items = fetch_media_list(cfg_snapshot)
             fingerprint = fingerprint_items(raw_items)
-            items = download_media(cfg_snapshot, raw_items)
-            updated = state.update(items, fingerprint)
-            if updated:
-                logging.info("Playlist updated: %d items", len(items))
-                status_snapshot = status.snapshot()
-                keep_paths = {item.path for item in items}
-                current = status_snapshot.get("current_item") or {}
-                next_item = status_snapshot.get("next_item") or {}
-                if isinstance(current, dict) and current.get("path"):
-                    keep_paths.add(current["path"])
-                if isinstance(next_item, dict) and next_item.get("path"):
-                    keep_paths.add(next_item["path"])
-                removed = cleanup_cache_dir(cfg_snapshot["cache_dir"], keep_paths)
-                status.update(last_cleanup=iso_now(), last_cleanup_removed=removed)
-                status_snapshot = status.snapshot()
-                send_telemetry(
-                    cfg_snapshot,
-                    status_snapshot,
-                    heartbeat_type="playlist",
-                    status="ok",
-                    notes="playlist updated",
-                    uptime_seconds=int(time.time() - status.start_time),
-                )
-            status.update(last_poll_success=iso_now(), last_poll_error=None, playlist_size=len(items))
+            items = download_media(cfg_snapshot, raw_items, cache_index)
+            switch_ok = True
+            if cfg_snapshot.get("require_full_download_before_switch"):
+                switch_ok = len(items) >= len(raw_items)
+                if not switch_ok:
+                    logging.warning(
+                        "Playlist download incomplete (%d/%d). Keeping current playlist.",
+                        len(items),
+                        len(raw_items),
+                    )
+            if switch_ok:
+                updated = state.update(items, fingerprint)
+                if updated:
+                    logging.info("Playlist updated: %d items", len(items))
+                if items and (updated or not os.path.exists(playlist_state_path(cfg_snapshot))):
+                    save_playlist_state(cfg_snapshot, items, fingerprint)
+                if updated:
+                    status_snapshot = status.snapshot()
+                    keep_paths = {item.path for item in items}
+                    current = status_snapshot.get("current_item") or {}
+                    next_item = status_snapshot.get("next_item") or {}
+                    if isinstance(current, dict) and current.get("path"):
+                        keep_paths.add(current["path"])
+                    if isinstance(next_item, dict) and next_item.get("path"):
+                        keep_paths.add(next_item["path"])
+                    removed = cleanup_cache_dir(
+                        cfg_snapshot["cache_dir"],
+                        keep_paths,
+                        cache_index,
+                        cfg_snapshot,
+                    )
+                    status.update(last_cleanup=iso_now(), last_cleanup_removed=removed)
+                    status_snapshot = status.snapshot()
+                    send_telemetry(
+                        cfg_snapshot,
+                        status_snapshot,
+                        heartbeat_type="playlist",
+                        status="ok",
+                        notes="playlist updated",
+                        uptime_seconds=int(time.time() - status.start_time),
+                    )
+                status.update(playlist_size=len(items))
+            else:
+                current_items, _ = state.get()
+                status.update(playlist_size=len(current_items))
+            status.update(last_poll_success=iso_now(), last_poll_error=None)
+            save_last_success(cfg_snapshot, iso_now())
             consecutive_failures = 0
             status.update(consecutive_failures=consecutive_failures)
             backoff = 2
@@ -879,21 +1150,65 @@ def status_writer(cfg: Dict, cfg_lock: threading.Lock, status: StatusState, stop
             time.sleep(0.2)
 
 
-def cleanup_cache_dir(cache_dir: str, keep_paths: set) -> int:
+def cleanup_cache_dir(
+    cache_dir: str,
+    keep_paths: set,
+    cache_index: CacheIndex,
+    cfg_snapshot: Dict,
+) -> int:
     removed = 0
     if not os.path.isdir(cache_dir):
         return removed
+
+    max_files = int(cfg_snapshot.get("cache_max_files") or 0)
+    max_bytes = int(cfg_snapshot.get("cache_max_bytes") or 0)
+    index_snapshot = cache_index.snapshot()
+
+    candidates: List[Tuple[str, int, float]] = []
+    total_size = 0
+    total_count = 0
     for name in os.listdir(cache_dir):
         path = os.path.join(cache_dir, name)
         if not os.path.isfile(path):
             continue
+        size = safe_getsize(path) or 0
+        total_size += size
+        total_count += 1
         if path in keep_paths:
             continue
+        meta = index_snapshot.get(path) or {}
+        last_used = meta.get("last_used")
+        last_used_ts = parse_iso_utc(last_used) if isinstance(last_used, str) else None
+        if last_used_ts is None:
+            try:
+                last_used_ts = os.path.getmtime(path)
+            except OSError:
+                last_used_ts = 0.0
+        candidates.append((path, size, float(last_used_ts)))
+
+    to_remove: List[str] = []
+    if max_files <= 0 and max_bytes <= 0:
+        to_remove = [path for path, _size, _ts in candidates]
+    else:
+        candidates.sort(key=lambda entry: entry[2])
+        while candidates and (
+            (max_files > 0 and total_count > max_files)
+            or (max_bytes > 0 and total_size > max_bytes)
+        ):
+            path, size, _ = candidates.pop(0)
+            to_remove.append(path)
+            total_count -= 1
+            total_size -= size
+
+    for path in to_remove:
         try:
             os.remove(path)
             removed += 1
         except Exception as exc:
             logging.warning("Failed to delete %s: %s", path, exc)
+
+    if removed:
+        cache_index.remove_missing()
     return removed
 
 
@@ -902,6 +1217,7 @@ def cleanup_worker(
     cfg_lock: threading.Lock,
     state: PlaylistState,
     status: StatusState,
+    cache_index: CacheIndex,
     stop_event: threading.Event,
 ) -> None:
     while not stop_event.is_set():
@@ -910,8 +1226,18 @@ def cleanup_worker(
         if interval <= 0:
             time.sleep(1)
             continue
+        status_snapshot = status.snapshot()
+        if cfg_snapshot.get("disable_cleanup_when_offline"):
+            failures = int(status_snapshot.get("consecutive_failures") or 0)
+            if failures > 0 or not status_snapshot.get("last_poll_success"):
+                for _ in range(int(interval * 5)):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.2)
+                continue
         items, _ = state.get()
         keep_paths = {item.path for item in items}
+        keep_paths.update(saved_playlist_paths(cfg_snapshot))
         snapshot = status.snapshot()
         current = snapshot.get("current_item") or {}
         next_item = snapshot.get("next_item") or {}
@@ -920,7 +1246,7 @@ def cleanup_worker(
         if isinstance(next_item, dict) and next_item.get("path"):
             keep_paths.add(next_item["path"])
 
-        removed = cleanup_cache_dir(cfg_snapshot["cache_dir"], keep_paths)
+        removed = cleanup_cache_dir(cfg_snapshot["cache_dir"], keep_paths, cache_index, cfg_snapshot)
         status.update(last_cleanup=iso_now(), last_cleanup_removed=removed)
 
         for _ in range(int(interval * 5)):
@@ -935,6 +1261,7 @@ def playback_loop(
     state: PlaylistState,
     status: StatusState,
     mpv: MPVController,
+    cache_index: CacheIndex,
     stop_event: threading.Event,
 ) -> None:
     idx = 0
@@ -992,6 +1319,7 @@ def playback_loop(
                 else None
             ),
         )
+        cache_index.touch(item)
 
         logging.info("Playing %s (%s ms)", item.url, item.duration_ms)
         end_time = time.time() + max(item.duration_ms, 1000) / 1000.0
@@ -1026,8 +1354,24 @@ def main() -> int:
     state = PlaylistState()
     status = StatusState()
     mpv = MPVController(cfg)
+    cache_index = CacheIndex(cfg)
+    cache_index.remove_missing()
     stop_event = threading.Event()
     force_exit = threading.Event()
+
+    if cfg.get("offline_fallback"):
+        saved_items, _saved_fp, saved_at = load_playlist_state(cfg)
+        if saved_items and offline_playlist_allowed(cfg, saved_at):
+            offline_items, fp_payload = media_items_from_saved(cfg, saved_items)
+            if offline_items:
+                offline_fp = fingerprint_items(fp_payload)
+                state.update(offline_items, offline_fp)
+                status.update(playlist_size=len(offline_items))
+                logging.info("Loaded offline playlist: %d items", len(offline_items))
+            else:
+                logging.warning("Offline playlist found but no cached files are available.")
+        elif saved_items:
+            logging.info("Offline playlist skipped due to max age policy.")
 
     def _force_kill_after_delay() -> None:
         time.sleep(5)
@@ -1056,7 +1400,7 @@ def main() -> int:
     threads = [
         threading.Thread(
             target=poller,
-            args=(cfg, cfg_lock, poll_now_event, state, status, stop_event),
+            args=(cfg, cfg_lock, poll_now_event, state, status, cache_index, stop_event),
             daemon=True,
         ),
         threading.Thread(
@@ -1071,7 +1415,7 @@ def main() -> int:
         ),
         threading.Thread(
             target=cleanup_worker,
-            args=(cfg, cfg_lock, state, status, stop_event),
+            args=(cfg, cfg_lock, state, status, cache_index, stop_event),
             daemon=True,
         ),
         threading.Thread(
@@ -1087,7 +1431,7 @@ def main() -> int:
     config_server.start()
 
     try:
-        playback_loop(cfg, cfg_lock, state, status, mpv, stop_event)
+        playback_loop(cfg, cfg_lock, state, status, mpv, cache_index, stop_event)
     finally:
         stop_event.set()
         for thread in threads:

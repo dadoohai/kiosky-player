@@ -45,6 +45,12 @@ Recomendacoes de midia:
 - Se entrar, baixa e entra no carrossel.
 - Limpeza extra do cache a cada 30 min (`cleanup_interval_sec`).
 
+## Modo offline
+
+- O player salva a ultima playlist localmente e tenta tocar offline no proximo start.
+- Se quiser limitar idade do offline: `offline_max_age_hours`.
+- Para evitar limpar cache sem internet: `disable_cleanup_when_offline`.
+
 ## Telemetria (a cada 5 min)
 
 - Envia healthcheck para `https://api.dadooh.ai/api/v1/interact/telemetry`.

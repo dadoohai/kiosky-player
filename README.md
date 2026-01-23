@@ -54,6 +54,12 @@ Opcional no `config.json`:
 - `config_ui_enabled`: true/false
 - `config_ui_bind` e `config_ui_port`
 - `low_resource_mode`: true/false (modo economia)
+- `state_dir`: pasta para arquivos de estado (vazio = `cache_dir/.state`)
+- `offline_fallback`: true/false (usar playlist salva ao iniciar sem internet)
+- `offline_max_age_hours`: 0 = sem limite, senao limita idade da playlist offline
+- `require_full_download_before_switch`: true/false (so troca playlist quando baixar tudo)
+- `disable_cleanup_when_offline`: true/false (nao limpa cache quando offline)
+- `cache_max_files` / `cache_max_bytes`: limites para limpeza por LRU (0 = desativado)
 - `telemetry_enabled`: true/false
 - `telemetry_interval_sec`: 300 (5 min)
 - `telemetry_url` e `station_id`
@@ -74,6 +80,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install/deps.ps1
 
 - Faz POST na API e coleta `media_urls` + `exposure_time_ms`.
 - Baixa midias para `media_cache/` e reutiliza cache se falhar.
+- Salva a ultima playlist localmente para tocar offline no proximo start.
 - Mantem um unico processo do MPV via IPC (menos flicker).
 - Pre-carrega o proximo item via playlist do MPV quando `preload_next=true`.
 - Reproduz cada item por `exposure_time_ms` em loop.
