@@ -28,7 +28,7 @@
   "low_resource_mode": false,
   "telemetry_enabled": true,
   "telemetry_url": "https://api.dadooh.ai/api/v1/interact/telemetry",
-  "telemetry_interval_sec": 300,
+  "telemetry_interval_sec": 60,
   "telemetry_timeout_sec": 10,
   "station_id": "",
   "preload_next": true,

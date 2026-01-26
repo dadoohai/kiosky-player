@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "low_resource_mode": False,
     "telemetry_enabled": True,
     "telemetry_url": "https://api.dadooh.ai/api/v1/interact/telemetry",
-    "telemetry_interval_sec": 300,
+    "telemetry_interval_sec": 60,
     "telemetry_timeout_sec": 10,
     "station_id": "",
     "preload_next": True,
