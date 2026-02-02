@@ -39,6 +39,9 @@
   "log_max_bytes": 5000000,
   "log_backup_count": 3,
   "watchdog_interval_sec": 10,
+  "playback_stall_sec": 25,
+  "playback_mismatch_sec": 10,
+  "tmp_max_age_sec": 3600,
   "status_file": "",
   "status_interval_sec": 5,
   "cleanup_interval_sec": 1800

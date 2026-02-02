@@ -72,6 +72,9 @@ DEFAULT_CONFIG = {
     "log_max_bytes": 5_000_000,
     "log_backup_count": 3,
     "watchdog_interval_sec": 10,
+    "playback_stall_sec": 25,
+    "playback_mismatch_sec": 10,
+    "tmp_max_age_sec": 3600,
     "status_file": "",
     "status_interval_sec": 5,
     "cleanup_interval_sec": 1800,
@@ -531,6 +534,11 @@ def cache_path(cache_dir: str, url: str) -> str:
     return os.path.join(cache_dir, f"{sha1_hex(url)}{ext}")
 
 
+def is_image_path(path: str) -> bool:
+    ext = os.path.splitext(path.lower())[1]
+    return ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
 def fetch_media_list(cfg: Dict) -> List[Dict]:
     if requests is None:
         raise RuntimeError("requests is required. Install with: pip install -r requirements.txt")
@@ -589,14 +597,28 @@ def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[Cache
                 logging.info("Downloading %s", url)
                 resp = requests.get(url, stream=True, timeout=cfg["request_timeout_sec"])
                 resp.raise_for_status()
+                expected_size = None
+                content_length = resp.headers.get("Content-Length")
+                if content_length and content_length.isdigit():
+                    expected_size = int(content_length)
                 tmp_path = f"{dest}.tmp"
+                bytes_written = 0
                 with open(tmp_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=1024 * 256):
                         if chunk:
                             fh.write(chunk)
+                            bytes_written += len(chunk)
+                if expected_size is not None and bytes_written < expected_size:
+                    raise IOError(f"Incomplete download ({bytes_written}/{expected_size} bytes)")
                 os.replace(tmp_path, dest)
             except Exception as exc:
                 logging.warning("Failed to download %s: %s", url, exc)
+                try:
+                    tmp_path = f"{dest}.tmp"
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception as cleanup_exc:
+                    logging.warning("Failed to cleanup temp file for %s: %s", url, cleanup_exc)
                 if os.path.exists(dest):
                     logging.info("Using cached file for %s", url)
                 else:
@@ -702,6 +724,10 @@ class MPVController:
         self._ipc = None
         self._ipc_socket = False
         self._lock = threading.Lock()
+        self._ipc_lock = threading.Lock()
+        self._request_id = 0
+        self._recv_buffer = ""
+        self._generation = 0
 
     def _cleanup_ipc_path(self) -> None:
         ipc_path = self._cfg["ipc_path"]
@@ -744,6 +770,7 @@ class MPVController:
         finally:
             self._ipc = None
             self._ipc_socket = False
+            self._recv_buffer = ""
 
     def start(self) -> None:
         with self._lock:
@@ -761,6 +788,7 @@ class MPVController:
             else:
                 popen_kwargs["start_new_session"] = True
             self._proc = subprocess.Popen(args, **popen_kwargs)
+            self._generation += 1
             if not self._open_ipc():
                 logging.warning("MPV IPC not available, restarting...")
                 self.restart()
@@ -798,39 +826,85 @@ class MPVController:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def _send(self, payload: Dict) -> bool:
+    def generation(self) -> int:
+        return self._generation
+
+    def _send(self, payload: Dict, expect_response: bool = False, timeout: float = 2.0) -> Optional[Dict]:
         data = (json.dumps(payload) + "\n").encode("utf-8")
         if self._ipc is None:
-            return False
-        try:
-            if self._ipc_socket:
-                self._ipc.sendall(data)
-                self._ipc.settimeout(2.0)
-                self._ipc.recv(4096)
-            else:
-                self._ipc.write(data)
-                self._ipc.flush()
-            return True
-        except Exception:
-            return False
+            return None if expect_response else False
+        with self._ipc_lock:
+            if expect_response:
+                self._request_id += 1
+                payload["request_id"] = self._request_id
+                data = (json.dumps(payload) + "\n").encode("utf-8")
+            try:
+                if self._ipc_socket:
+                    self._ipc.sendall(data)
+                else:
+                    self._ipc.write(data)
+                    self._ipc.flush()
+            except Exception:
+                return None if expect_response else False
+            if not expect_response:
+                return True
+            return self._recv_response(self._request_id, timeout)
+
+    def _recv_response(self, request_id: int, timeout: float) -> Optional[Dict]:
+        if not self._ipc_socket or self._ipc is None:
+            return None
+        deadline = time.time() + max(timeout, 0.1)
+        buffer = self._recv_buffer
+        while time.time() < deadline:
+            if "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                if line:
+                    try:
+                        payload = json.loads(line)
+                    except Exception:
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("request_id") == request_id:
+                        self._recv_buffer = buffer
+                        return payload
+            try:
+                self._ipc.settimeout(max(deadline - time.time(), 0.1))
+                chunk = self._ipc.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="ignore")
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+        self._recv_buffer = buffer
+        return None
 
     def load_file(self, path: str) -> bool:
-        return self._send({"command": ["loadfile", path, "replace"]})
+        return bool(self._send({"command": ["loadfile", path, "replace"]}))
 
     def append_file(self, path: str) -> bool:
-        return self._send({"command": ["loadfile", path, "append"]})
+        return bool(self._send({"command": ["loadfile", path, "append"]}))
 
     def playlist_next(self) -> bool:
-        return self._send({"command": ["playlist-next", "force"]})
+        return bool(self._send({"command": ["playlist-next", "force"]}))
 
     def playlist_remove(self, index: int) -> bool:
-        return self._send({"command": ["playlist-remove", index]})
+        return bool(self._send({"command": ["playlist-remove", index]}))
 
     def set_property(self, name: str, value: object) -> bool:
-        return self._send({"command": ["set_property", name, value]})
+        return bool(self._send({"command": ["set_property", name, value]}))
 
     def ping(self) -> bool:
-        return self._send({"command": ["get_property", "idle-active"]})
+        if not self._ipc_socket:
+            return bool(self._send({"command": ["get_property", "idle-active"]}))
+        payload = self._send({"command": ["get_property", "idle-active"]}, expect_response=True, timeout=2.0)
+        return isinstance(payload, dict) and payload.get("error") == "success"
+
+    def get_property(self, name: str, timeout: float = 2.0) -> Optional[object]:
+        payload = self._send({"command": ["get_property", name]}, expect_response=True, timeout=timeout)
+        if isinstance(payload, dict) and payload.get("error") == "success":
+            return payload.get("data")
+        return None
 
 
 class ConfigServer:
@@ -1049,6 +1123,9 @@ def watchdog(
     status: StatusState,
     stop_event: threading.Event,
 ) -> None:
+    last_time_pos: Optional[float] = None
+    last_time_pos_at = time.time()
+    last_path_mismatch_at: Optional[float] = None
     while not stop_event.is_set():
         try:
             mpv.ensure_running()
@@ -1059,6 +1136,48 @@ def watchdog(
         except Exception as exc:
             logging.warning("Watchdog error: %s", exc)
         cfg_snapshot = config_snapshot(cfg, cfg_lock)
+        stall_sec = int(cfg_snapshot.get("playback_stall_sec") or 0)
+        mismatch_sec = int(cfg_snapshot.get("playback_mismatch_sec") or 0)
+        status_snapshot = status.snapshot()
+        current_item = status_snapshot.get("current_item") or {}
+        expected_path = current_item.get("path") if isinstance(current_item, dict) else None
+        if mismatch_sec <= 0:
+            last_path_mismatch_at = None
+        elif expected_path:
+            actual_path = mpv.get_property("path")
+            if isinstance(actual_path, str):
+                if os.path.normpath(actual_path) != os.path.normpath(expected_path):
+                    if last_path_mismatch_at is None:
+                        last_path_mismatch_at = time.time()
+                    elif time.time() - last_path_mismatch_at > mismatch_sec:
+                        logging.warning(
+                            "MPV path mismatch (expected %s, got %s), restarting",
+                            expected_path,
+                            actual_path,
+                        )
+                        mpv.restart()
+                        last_path_mismatch_at = None
+                        last_time_pos = None
+                        last_time_pos_at = time.time()
+                else:
+                    last_path_mismatch_at = None
+            else:
+                last_path_mismatch_at = None
+
+        if stall_sec > 0 and expected_path and not is_image_path(expected_path):
+            time_pos = mpv.get_property("time-pos")
+            if isinstance(time_pos, (int, float)):
+                if last_time_pos is None or time_pos != last_time_pos:
+                    last_time_pos = float(time_pos)
+                    last_time_pos_at = time.time()
+                elif time.time() - last_time_pos_at > stall_sec:
+                    logging.warning("MPV playback stalled for %.1fs, restarting", time.time() - last_time_pos_at)
+                    mpv.restart()
+                    last_time_pos = None
+                    last_time_pos_at = time.time()
+            else:
+                last_time_pos = None
+                last_time_pos_at = time.time()
         interval = int(cfg_snapshot.get("watchdog_interval_sec") or 0)
         for _ in range(int(interval * 5)):
             if stop_event.is_set():
@@ -1212,6 +1331,31 @@ def cleanup_cache_dir(
     return removed
 
 
+def cleanup_temp_files(cache_dir: str, max_age_sec: int) -> int:
+    if max_age_sec <= 0 or not os.path.isdir(cache_dir):
+        return 0
+    now = time.time()
+    removed = 0
+    for name in os.listdir(cache_dir):
+        if not name.endswith(".tmp"):
+            continue
+        path = os.path.join(cache_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            age = max_age_sec + 1
+        if age < max_age_sec:
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except Exception as exc:
+            logging.warning("Failed to delete temp file %s: %s", path, exc)
+    return removed
+
+
 def cleanup_worker(
     cfg: Dict,
     cfg_lock: threading.Lock,
@@ -1226,6 +1370,8 @@ def cleanup_worker(
         if interval <= 0:
             time.sleep(1)
             continue
+        temp_max_age = int(cfg_snapshot.get("tmp_max_age_sec") or 0)
+        temp_removed = cleanup_temp_files(cfg_snapshot["cache_dir"], temp_max_age)
         status_snapshot = status.snapshot()
         if cfg_snapshot.get("disable_cleanup_when_offline"):
             failures = int(status_snapshot.get("consecutive_failures") or 0)
@@ -1247,7 +1393,7 @@ def cleanup_worker(
             keep_paths.add(next_item["path"])
 
         removed = cleanup_cache_dir(cfg_snapshot["cache_dir"], keep_paths, cache_index, cfg_snapshot)
-        status.update(last_cleanup=iso_now(), last_cleanup_removed=removed)
+        status.update(last_cleanup=iso_now(), last_cleanup_removed=removed + temp_removed)
 
         for _ in range(int(interval * 5)):
             if stop_event.is_set():
@@ -1267,6 +1413,7 @@ def playback_loop(
     idx = 0
     last_version = -1
     preloaded_path: Optional[str] = None
+    last_mpv_generation = -1
     while not stop_event.is_set():
         items, version = state.get()
         if version != last_version:
@@ -1285,6 +1432,9 @@ def playback_loop(
             next_item = items[(idx + 1) % len(items)]
 
         mpv.ensure_running()
+        if mpv.generation() != last_mpv_generation:
+            last_mpv_generation = mpv.generation()
+            preloaded_path = None
         if preloaded_path != item.path:
             if not mpv.load_file(item.path):
                 logging.warning("Failed to load media, restarting MPV")
