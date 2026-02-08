@@ -44,5 +44,11 @@
   "tmp_max_age_sec": 3600,
   "status_file": "",
   "status_interval_sec": 5,
-  "cleanup_interval_sec": 1800
+  "cleanup_interval_sec": 1800,
+  "sync_enabled": true,
+  "sync_drift_threshold_ms": 300,
+  "sync_hard_resync_ms": 1200,
+  "sync_boot_hard_check_sec": 300,
+  "sync_checkpoint_interval_sec": 3600,
+  "sync_ntp_command": "chronyc -a makestep"
 }

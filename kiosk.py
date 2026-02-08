@@ -31,6 +31,12 @@ def default_ipc_path() -> str:
     return os.path.join(tempfile.gettempdir(), "mpv-kiosk.sock")
 
 
+def default_sync_ntp_command() -> str:
+    if sys.platform.startswith("linux"):
+        return "chronyc -a makestep"
+    return ""
+
+
 DEFAULT_CONFIG = {
     "api_url": "https://us-central1-habitat-19883.cloudfunctions.net/api/search",
     "api_key": "",
@@ -78,7 +84,17 @@ DEFAULT_CONFIG = {
     "status_file": "",
     "status_interval_sec": 5,
     "cleanup_interval_sec": 1800,
+    "sync_enabled": True,
+    "sync_drift_threshold_ms": 300,
+    "sync_hard_resync_ms": 1200,
+    "sync_boot_hard_check_sec": 300,
+    "sync_checkpoint_interval_sec": 3600,
+    "sync_ntp_command": default_sync_ntp_command(),
 }
+
+SECONDS_PER_DAY = 24 * 3600
+SYNC_DAILY_ANCHOR_SEC_UTC = 5 * 60
+SYNC_PREP_WINDOW_START_SEC_UTC = 23 * 3600 + 58 * 60
 
 
 @dataclass(frozen=True)
@@ -88,6 +104,15 @@ class MediaItem:
     path: str
     campaign_id: str
     campaign_name: str
+
+
+@dataclass(frozen=True)
+class CyclePosition:
+    index: int
+    offset_ms: int
+    cycle_pos_ms: int
+    cycle_total_ms: int
+    anchor_ts: float
 
 
 class PlaylistState:
@@ -152,11 +177,143 @@ def iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def iso_from_ts(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp))
+
+
 def parse_iso_utc(value: str) -> Optional[int]:
     try:
         return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
     except Exception:
         return None
+
+
+def effective_duration_ms(duration_ms: int) -> int:
+    try:
+        parsed = int(duration_ms)
+    except Exception:
+        parsed = 0
+    return max(parsed, 1000)
+
+
+def cycle_timeline(items: List[MediaItem]) -> Tuple[List[int], List[int], int]:
+    durations: List[int] = []
+    cycle_start_ms: List[int] = []
+    total = 0
+    for item in items:
+        duration = effective_duration_ms(item.duration_ms)
+        durations.append(duration)
+        cycle_start_ms.append(total)
+        total += duration
+    return durations, cycle_start_ms, total
+
+
+def seconds_since_midnight_utc(now_ts: float) -> int:
+    utc_now = time.gmtime(now_ts)
+    return utc_now.tm_hour * 3600 + utc_now.tm_min * 60 + utc_now.tm_sec
+
+
+def daily_anchor_utc_ts(now_ts: float) -> float:
+    utc_now = time.gmtime(now_ts)
+    anchor = calendar.timegm((utc_now.tm_year, utc_now.tm_mon, utc_now.tm_mday, 0, 5, 0, 0, 0, 0))
+    if now_ts < anchor:
+        anchor -= SECONDS_PER_DAY
+    return float(anchor)
+
+
+def next_daily_anchor_utc_ts(now_ts: float) -> float:
+    utc_now = time.gmtime(now_ts)
+    anchor = calendar.timegm((utc_now.tm_year, utc_now.tm_mon, utc_now.tm_mday, 0, 5, 0, 0, 0, 0))
+    if now_ts < anchor:
+        return float(anchor)
+    return float(anchor + SECONDS_PER_DAY)
+
+
+def is_prep_window_utc(now_ts: float) -> bool:
+    sec = seconds_since_midnight_utc(now_ts)
+    return sec >= SYNC_PREP_WINDOW_START_SEC_UTC or sec < SYNC_DAILY_ANCHOR_SEC_UTC
+
+
+def compute_cycle_position_from_utc(now_ts: float, durations_ms: List[int]) -> CyclePosition:
+    if not durations_ms:
+        raise ValueError("durations_ms cannot be empty")
+    cycle_total = max(sum(durations_ms), 1)
+    anchor_ts = daily_anchor_utc_ts(now_ts)
+    elapsed_ms = int((now_ts - anchor_ts) * 1000) % cycle_total
+    cursor = 0
+    for idx, duration in enumerate(durations_ms):
+        next_cursor = cursor + duration
+        if elapsed_ms < next_cursor:
+            return CyclePosition(
+                index=idx,
+                offset_ms=elapsed_ms - cursor,
+                cycle_pos_ms=elapsed_ms,
+                cycle_total_ms=cycle_total,
+                anchor_ts=anchor_ts,
+            )
+        cursor = next_cursor
+    last_idx = len(durations_ms) - 1
+    last_duration = durations_ms[last_idx]
+    return CyclePosition(
+        index=last_idx,
+        offset_ms=max(last_duration - 1, 0),
+        cycle_pos_ms=max(cycle_total - 1, 0),
+        cycle_total_ms=cycle_total,
+        anchor_ts=anchor_ts,
+    )
+
+
+def signed_cycle_delta_ms(target_ms: int, current_ms: int, cycle_total_ms: int) -> int:
+    if cycle_total_ms <= 0:
+        return 0
+    half = cycle_total_ms / 2.0
+    delta = ((target_ms - current_ms + half) % cycle_total_ms) - half
+    return int(round(delta))
+
+
+def classify_drift_action(
+    drift_ms: int,
+    drift_threshold_ms: int,
+    hard_resync_ms: int,
+) -> str:
+    threshold = max(int(drift_threshold_ms), 0)
+    hard = max(int(hard_resync_ms), threshold)
+    abs_drift = abs(int(drift_ms))
+    if abs_drift < threshold:
+        return "none"
+    if abs_drift >= hard:
+        return "hard_resync"
+    return "soft_resync"
+
+
+def next_hour_checkpoint_utc_ts(now_ts: float, interval_sec: int = 3600) -> float:
+    if interval_sec <= 0:
+        interval_sec = 3600
+    now_int = int(now_ts)
+    return float(((now_int // interval_sec) + 1) * interval_sec)
+
+
+def run_ntp_sync_command(cfg_snapshot: Dict) -> None:
+    command = str(cfg_snapshot.get("sync_ntp_command") or "").strip()
+    if not command:
+        logging.info("Sync prep: sync_ntp_command vazio; assumindo NTP do sistema.")
+        return
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    except Exception as exc:
+        logging.warning("Sync prep: falha ao executar sync_ntp_command: %s", exc)
+        return
+    if result.returncode == 0:
+        logging.info("Sync prep: sync_ntp_command executado com sucesso.")
+    else:
+        logging.warning("Sync prep: sync_ntp_command retornou %s.", result.returncode)
 
 
 def state_dir(cfg: Dict) -> str:
@@ -433,6 +590,14 @@ class StatusState:
             "last_cleanup_removed": None,
             "consecutive_failures": 0,
             "last_telemetry_error": None,
+            "sync_mode": "idle",
+            "sync_anchor_utc": None,
+            "sync_drift_ms": None,
+            "sync_last_check_utc": None,
+            "sync_last_action": None,
+            "sync_next_checkpoint_utc": None,
+            "sync_checkpoint_reason": None,
+            "sync_cycle_ms": None,
         }
         self.start_time = time.time()
 
@@ -893,6 +1058,9 @@ class MPVController:
 
     def set_property(self, name: str, value: object) -> bool:
         return bool(self._send({"command": ["set_property", name, value]}))
+
+    def seek_absolute(self, seconds: float) -> bool:
+        return bool(self._send({"command": ["seek", float(seconds), "absolute+exact"]}))
 
     def ping(self) -> bool:
         if not self._ipc_socket:
@@ -1411,40 +1579,144 @@ def playback_loop(
     stop_event: threading.Event,
 ) -> None:
     idx = 0
+    offset_ms = 0
     last_version = -1
     preloaded_path: Optional[str] = None
     last_mpv_generation = -1
+
+    boot_wall_ts = time.time()
+    boot_mono_ts = time.monotonic()
+    pending_soft_resync = False
+
+    cfg_snapshot = config_snapshot(cfg, cfg_lock)
+    sync_enabled = bool(cfg_snapshot.get("sync_enabled", True))
+    drift_threshold_ms = int(cfg_snapshot.get("sync_drift_threshold_ms") or 300)
+    hard_resync_ms = int(cfg_snapshot.get("sync_hard_resync_ms") or 1200)
+    checkpoint_interval_sec = int(cfg_snapshot.get("sync_checkpoint_interval_sec") or 3600)
+    boot_hard_check_sec = int(cfg_snapshot.get("sync_boot_hard_check_sec") or 300)
+    boot_hard_check_due_mono: Optional[float] = None
+    next_checkpoint_ts: Optional[float] = None
+    force_daily_zero_once = False
+
+    if sync_enabled:
+        if is_prep_window_utc(boot_wall_ts):
+            prep_anchor_ts = next_daily_anchor_utc_ts(boot_wall_ts)
+            status.update(
+                sync_mode="prep",
+                sync_anchor_utc=iso_from_ts(prep_anchor_ts),
+                sync_last_action="prep_wait_anchor",
+            )
+            run_ntp_sync_command(cfg_snapshot)
+            wait_sec = max(prep_anchor_ts - time.time(), 0.0)
+            logging.info(
+                "Sync PREP ativo no boot. Aguardando 00:05 UTC por %.2fs para forcar index=0/offset=0.",
+                wait_sec,
+            )
+            while not stop_event.is_set():
+                if time.time() >= prep_anchor_ts:
+                    break
+                time.sleep(0.2)
+            if stop_event.is_set():
+                return
+            force_daily_zero_once = True
+            status.update(
+                sync_mode="running",
+                sync_anchor_utc=iso_from_ts(prep_anchor_ts),
+                sync_last_action="daily_zero_ready",
+            )
+            logging.info("Sync PREP concluido. Player iniciara em index=0/offset=0.")
+        else:
+            status.update(sync_mode="running")
+
+        if boot_hard_check_sec > 0:
+            boot_hard_check_due_mono = boot_mono_ts + boot_hard_check_sec
+        next_checkpoint_ts = next_hour_checkpoint_utc_ts(time.time(), checkpoint_interval_sec)
+        status.update(sync_next_checkpoint_utc=iso_from_ts(next_checkpoint_ts))
+    else:
+        status.update(sync_mode="disabled")
+
     while not stop_event.is_set():
         items, version = state.get()
-        if version != last_version:
-            idx = 0
-            last_version = version
-            preloaded_path = None
-
         if not items:
             time.sleep(1)
             continue
 
+        durations_ms, cycle_start_ms, cycle_total_ms = cycle_timeline(items)
+        if cycle_total_ms <= 0:
+            time.sleep(1)
+            continue
+
         cfg_snapshot = config_snapshot(cfg, cfg_lock)
-        item = items[idx % len(items)]
+        sync_enabled = bool(cfg_snapshot.get("sync_enabled", True))
+        drift_threshold_ms = int(cfg_snapshot.get("sync_drift_threshold_ms") or 300)
+        hard_resync_ms = int(cfg_snapshot.get("sync_hard_resync_ms") or 1200)
+        checkpoint_interval_sec = int(cfg_snapshot.get("sync_checkpoint_interval_sec") or 3600)
+
+        if sync_enabled and next_checkpoint_ts is None:
+            next_checkpoint_ts = next_hour_checkpoint_utc_ts(time.time(), checkpoint_interval_sec)
+            status.update(sync_next_checkpoint_utc=iso_from_ts(next_checkpoint_ts))
+        if not sync_enabled:
+            pending_soft_resync = False
+            boot_hard_check_due_mono = None
+            next_checkpoint_ts = None
+            status.update(sync_mode="disabled", sync_cycle_ms=cycle_total_ms)
+        else:
+            status.update(sync_mode="running", sync_cycle_ms=cycle_total_ms)
+
+        if version != last_version:
+            last_version = version
+            preloaded_path = None
+            pending_soft_resync = False
+            if sync_enabled:
+                if force_daily_zero_once:
+                    idx = 0
+                    offset_ms = 0
+                    force_daily_zero_once = False
+                    status.update(sync_last_action="daily_zero_applied")
+                    logging.info("Sync daily zero aplicado em 00:05 UTC (index=0, offset=0).")
+                else:
+                    sync_pos = compute_cycle_position_from_utc(time.time(), durations_ms)
+                    idx = sync_pos.index
+                    offset_ms = sync_pos.offset_ms
+                    status.update(
+                        sync_anchor_utc=iso_from_ts(sync_pos.anchor_ts),
+                        sync_last_action="playlist_realign",
+                    )
+                    logging.info(
+                        "Playlist alterada. Recalculando posicao UTC: index=%d offset=%dms",
+                        idx,
+                        offset_ms,
+                    )
+            else:
+                idx = 0
+                offset_ms = 0
+
+        idx = idx % len(items)
+        item = items[idx]
+        item_duration_ms = durations_ms[idx]
         next_item = None
-        if cfg_snapshot.get("preload_next") and len(items) > 1:
+        if len(items) > 1:
             next_item = items[(idx + 1) % len(items)]
 
         mpv.ensure_running()
         if mpv.generation() != last_mpv_generation:
             last_mpv_generation = mpv.generation()
             preloaded_path = None
-        if preloaded_path != item.path:
+        reuse_preloaded = preloaded_path == item.path and offset_ms <= 0
+        if not reuse_preloaded:
             if not mpv.load_file(item.path):
                 logging.warning("Failed to load media, restarting MPV")
                 mpv.restart()
                 if not mpv.load_file(item.path):
                     time.sleep(1)
                     continue
+            if offset_ms > 0 and not is_image_path(item.path):
+                offset_seconds = offset_ms / 1000.0
+                if not mpv.seek_absolute(offset_seconds):
+                    mpv.set_property("time-pos", offset_seconds)
         preloaded_path = None
 
-        if next_item is not None:
+        if next_item is not None and cfg_snapshot.get("preload_next"):
             mpv.append_file(next_item.path)
 
         status.update(
@@ -1452,10 +1724,11 @@ def playback_loop(
             current_item={
                 "url": item.url,
                 "path": item.path,
-                "duration_ms": item.duration_ms,
+                "duration_ms": item_duration_ms,
                 "campaign_id": item.campaign_id,
                 "campaign_name": item.campaign_name,
                 "started_at": iso_now(),
+                "offset_ms": offset_ms,
             },
             next_item=(
                 {
@@ -1471,19 +1744,100 @@ def playback_loop(
         )
         cache_index.touch(item)
 
-        logging.info("Playing %s (%s ms)", item.url, item.duration_ms)
-        end_time = time.time() + max(item.duration_ms, 1000) / 1000.0
-        while time.time() < end_time and not stop_event.is_set():
+        logging.info("Playing %s (duration=%s ms, offset=%s ms)", item.url, item_duration_ms, offset_ms)
+        item_started_mono = time.monotonic()
+        remaining_ms = max(item_duration_ms - offset_ms, 1)
+        current_cycle_start_ms = cycle_start_ms[idx]
+        hard_resync_requested = False
+
+        while not stop_event.is_set():
+            now_mono = time.monotonic()
+            elapsed_ms = int((now_mono - item_started_mono) * 1000)
+            if elapsed_ms >= remaining_ms:
+                break
+
+            check_reason: Optional[str] = None
+            now_ts = time.time()
+            if sync_enabled:
+                if boot_hard_check_due_mono is not None and now_mono >= boot_hard_check_due_mono:
+                    check_reason = "boot_5min"
+                    boot_hard_check_due_mono = None
+                elif next_checkpoint_ts is not None and now_ts >= next_checkpoint_ts:
+                    check_reason = "utc_checkpoint"
+                    next_checkpoint_ts = next_hour_checkpoint_utc_ts(now_ts, checkpoint_interval_sec)
+                    status.update(sync_next_checkpoint_utc=iso_from_ts(next_checkpoint_ts))
+
+            if check_reason:
+                sync_pos = compute_cycle_position_from_utc(now_ts, durations_ms)
+                actual_offset_ms = min(offset_ms + elapsed_ms, item_duration_ms)
+                actual_cycle_pos_ms = (current_cycle_start_ms + actual_offset_ms) % sync_pos.cycle_total_ms
+                drift_ms = signed_cycle_delta_ms(
+                    target_ms=sync_pos.cycle_pos_ms,
+                    current_ms=actual_cycle_pos_ms,
+                    cycle_total_ms=sync_pos.cycle_total_ms,
+                )
+                action = classify_drift_action(
+                    drift_ms=drift_ms,
+                    drift_threshold_ms=drift_threshold_ms,
+                    hard_resync_ms=hard_resync_ms,
+                )
+                status.update(
+                    sync_anchor_utc=iso_from_ts(sync_pos.anchor_ts),
+                    sync_drift_ms=drift_ms,
+                    sync_last_check_utc=iso_from_ts(now_ts),
+                    sync_checkpoint_reason=check_reason,
+                )
+
+                if action == "hard_resync":
+                    idx = sync_pos.index
+                    offset_ms = sync_pos.offset_ms
+                    pending_soft_resync = False
+                    hard_resync_requested = True
+                    preloaded_path = None
+                    status.update(sync_last_action=f"hard_resync:{check_reason}")
+                    logging.warning(
+                        "Hard resync (%s): drift=%dms -> index=%d offset=%dms",
+                        check_reason,
+                        drift_ms,
+                        idx,
+                        offset_ms,
+                    )
+                    break
+                if action == "soft_resync":
+                    pending_soft_resync = True
+                    status.update(sync_last_action=f"soft_resync_pending:{check_reason}")
+                    logging.info("Soft resync agendado (%s): drift=%dms", check_reason, drift_ms)
+                else:
+                    status.update(sync_last_action=f"stable:{check_reason}")
+
             time.sleep(0.2)
+
+        if hard_resync_requested:
+            continue
+
+        if sync_enabled and pending_soft_resync:
+            sync_pos = compute_cycle_position_from_utc(time.time(), durations_ms)
+            idx = sync_pos.index
+            offset_ms = sync_pos.offset_ms
+            pending_soft_resync = False
+            preloaded_path = None
+            status.update(
+                sync_anchor_utc=iso_from_ts(sync_pos.anchor_ts),
+                sync_last_action="soft_resync_applied",
+            )
+            logging.info("Soft resync aplicado na borda: index=%d offset=%dms", idx, offset_ms)
+            continue
 
         if next_item is not None and cfg_snapshot.get("preload_next"):
             if mpv.playlist_next():
                 mpv.playlist_remove(0)
                 preloaded_path = next_item.path
                 idx += 1
+                offset_ms = 0
                 continue
 
         idx += 1
+        offset_ms = 0
 
 
 def main() -> int:

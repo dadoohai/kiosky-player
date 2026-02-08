@@ -66,6 +66,12 @@ Opcional no `config.json`:
 - `playback_stall_sec`: reinicia MPV se o tempo de reprodução travar (0 desativa)
 - `playback_mismatch_sec`: reinicia MPV se o arquivo atual não trocar (0 desativa)
 - `tmp_max_age_sec`: remove downloads temporários antigos do cache
+- `sync_enabled`: ativa sincronismo global por UTC
+- `sync_drift_threshold_ms`: drift minimo para correcao suave (padrao 300ms)
+- `sync_hard_resync_ms`: drift para resync imediato (padrao 1200ms)
+- `sync_boot_hard_check_sec`: checagem final apos boot (padrao 300s)
+- `sync_checkpoint_interval_sec`: checkpoint UTC periodico (padrao 3600s)
+- `sync_ntp_command`: comando executado no modo PREP (default Linux: `chronyc -a makestep`; demais SO: vazio)
 
 ## Instalacao rapida de dependencias
 
@@ -88,9 +94,22 @@ powershell -ExecutionPolicy Bypass -File scripts/install/deps.ps1
 - Pre-carrega o proximo item via playlist do MPV quando `preload_next=true`.
 - Reproduz cada item por `exposure_time_ms` em loop.
 - Recarrega a playlist quando a API muda.
+- Sincronismo global com ancora fixa diaria `00:05:00 UTC`.
+- Boot perto da meia-noite (`23:58-00:05 UTC`) entra em modo PREP e forca `index=0/offset=0` em `00:05 UTC`.
+- Boot fora dessa janela entra direto na posicao UTC atual do ciclo (`pos = (agora_utc - ancora) % ciclo_total`).
+- Check de drift apos 5 min de uptime e checkpoints UTC periodicos com correcao suave/imediata.
 - Watchdog reinicia o MPV se travar ou perder o IPC.
 - Limpa midias antigas do cache a cada `cleanup_interval_sec` (padrao 30 min).
 - Telemetria enviada a cada 5 min (healthcheck), com evento de startup e playlist update.
+
+## Regra de sincronismo diario
+
+- Regra principal: zero diario em `00:05 UTC` para todos os players.
+- Nao use ancora baseada em uptime (ex.: "5 min apos ligar"), pois isso dessicroniza os devices.
+- Drift policy:
+  - `< 300ms`: nao corrige
+  - `300-1199ms`: corrige na proxima borda
+  - `>= 1200ms`: resync imediato
 
 ## Auto start (24/7)
 
