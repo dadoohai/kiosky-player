@@ -14,10 +14,11 @@ Este projeto cria um player kiosk que busca midias em uma API, faz polling para 
 
 1. Copie o arquivo de exemplo e edite:
    - `cp config.example.json config.json`
-2. Preencha `api_key` e `environment_id`.
+2. Preencha `api_key` e `environment_id` (ou rode em modo offline com cache local).
 3. (Opcional) ajuste `poll_interval_sec` (padrao 1800s), `mute`, `mpv_path`, `log_file`, `watchdog_interval_sec` e `preload_next`.
 4. `ipc_path` vazio usa um padrao automatico (socket no Linux/macOS, named pipe no Windows).
 5. Para status/monitoramento, defina `status_file` (JSON) e `status_interval_sec`.
+6. Caminhos relativos (`cache_dir`, `state_dir`, `log_file`, `status_file`, `ipc_path`) sao resolvidos em relacao a pasta do `config.json`.
 
 ## Rodar localmente
 
@@ -57,7 +58,9 @@ Opcional no `config.json`:
 - `state_dir`: pasta para arquivos de estado (vazio = `cache_dir/.state`)
 - `offline_fallback`: true/false (usar playlist salva ao iniciar sem internet)
 - `offline_max_age_hours`: 0 = sem limite, senao limita idade da playlist offline
+- `offline_ignore_max_age_when_no_network`: true/false (ignora idade offline quando API estiver inacessivel no boot)
 - `require_full_download_before_switch`: true/false (so troca playlist quando baixar tudo)
+- `allow_empty_playlist_from_api`: true/false (false = ignora resposta vazia da API e mantem playlist atual)
 - `disable_cleanup_when_offline`: true/false (nao limpa cache quando offline)
 - `cache_max_files` / `cache_max_bytes`: limites para limpeza por LRU (0 = desativado)
 - `telemetry_enabled`: true/false
@@ -65,12 +68,14 @@ Opcional no `config.json`:
 - `telemetry_url` e `station_id`
 - `playback_stall_sec`: reinicia MPV se o tempo de reprodução travar (0 desativa)
 - `playback_mismatch_sec`: reinicia MPV se o arquivo atual não trocar (0 desativa)
+- `media_load_retry_cooldown_sec`: cooldown para tentar novamente midia que falhou ao carregar
 - `tmp_max_age_sec`: remove downloads temporários antigos do cache
 - `sync_enabled`: ativa sincronismo global por UTC
 - `sync_drift_threshold_ms`: drift minimo para correcao suave (padrao 300ms)
 - `sync_hard_resync_ms`: drift para resync imediato (padrao 1200ms)
 - `sync_boot_hard_check_sec`: checagem final apos boot (padrao 300s)
 - `sync_checkpoint_interval_sec`: checkpoint UTC periodico (padrao 3600s)
+- `sync_prep_mode`: `play_then_resync` (evita tela preta na janela PREP) ou `wait_until_anchor`
 - `sync_ntp_command`: comando executado no modo PREP (default Linux: `chronyc -a makestep`; demais SO: vazio)
 
 ## Instalacao rapida de dependencias
@@ -90,15 +95,21 @@ powershell -ExecutionPolicy Bypass -File scripts/install/deps.ps1
 - Faz POST na API e coleta `media_urls` + `exposure_time_ms`.
 - Baixa midias para `media_cache/` e reutiliza cache se falhar.
 - Salva a ultima playlist localmente para tocar offline no proximo start.
+- Se nao houver estado salvo, monta playlist offline diretamente pelos arquivos do cache.
+- Se API/credenciais nao estiverem disponiveis no boot, continua em modo offline quando houver cache valido.
 - Mantem um unico processo do MPV via IPC (menos flicker).
 - Pre-carrega o proximo item via playlist do MPV quando `preload_next=true`.
 - Reproduz cada item por `exposure_time_ms` em loop.
 - Recarrega a playlist quando a API muda.
+- Por padrao, se a API retornar lista vazia, mantem a playlist atual (`allow_empty_playlist_from_api=false`).
 - Sincronismo global com ancora fixa diaria `00:05:00 UTC`.
-- Boot perto da meia-noite (`23:58-00:05 UTC`) entra em modo PREP e forca `index=0/offset=0` em `00:05 UTC`.
+- Boot perto da meia-noite (`23:58-00:05 UTC`) usa `sync_prep_mode`:
+  - `play_then_resync` (padrao): toca imediatamente e aplica zero em `00:05 UTC`
+  - `wait_until_anchor`: aguarda `00:05 UTC` antes de tocar
 - Boot fora dessa janela entra direto na posicao UTC atual do ciclo (`pos = (agora_utc - ancora) % ciclo_total`).
 - Check de drift apos 5 min de uptime e checkpoints UTC periodicos com correcao suave/imediata.
 - Watchdog reinicia o MPV se travar ou perder o IPC.
+- Se uma midia falhar ao carregar, ela entra em cooldown e o player avanca para a proxima.
 - Limpa midias antigas do cache a cada `cleanup_interval_sec` (padrao 30 min).
 - Telemetria enviada a cada 5 min (healthcheck), com evento de startup e playlist update.
 

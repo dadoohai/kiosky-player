@@ -48,8 +48,17 @@ Recomendacoes de midia:
 ## Modo offline
 
 - O player salva a ultima playlist localmente e tenta tocar offline no proximo start.
+- Se o estado offline sumir, ele tenta montar playlist usando os arquivos existentes no cache.
 - Se quiser limitar idade do offline: `offline_max_age_hours`.
+- Se a API estiver fora no boot, pode ignorar a idade offline com `offline_ignore_max_age_when_no_network=true`.
+- Para impedir troca para vazio quando API responder sem itens: `allow_empty_playlist_from_api` (recomendado `false`).
 - Para evitar limpar cache sem internet: `disable_cleanup_when_offline`.
+
+## Reinicio 00:00 / PREP
+
+- `sync_prep_mode=play_then_resync` (padrao): evita tela preta na janela `23:58-00:05 UTC`.
+- `sync_prep_mode=wait_until_anchor`: aguarda `00:05 UTC` para iniciar.
+- Midia com falha de carga entra em cooldown (`media_load_retry_cooldown_sec`) e o player avanca para a proxima.
 
 ## Telemetria (a cada 5 min)
 

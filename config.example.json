@@ -13,7 +13,9 @@
   "state_dir": "",
   "offline_fallback": true,
   "offline_max_age_hours": 0,
+  "offline_ignore_max_age_when_no_network": true,
   "require_full_download_before_switch": true,
+  "allow_empty_playlist_from_api": false,
   "disable_cleanup_when_offline": true,
   "cache_max_files": 0,
   "cache_max_bytes": 0,
@@ -41,6 +43,7 @@
   "watchdog_interval_sec": 10,
   "playback_stall_sec": 25,
   "playback_mismatch_sec": 10,
+  "media_load_retry_cooldown_sec": 60,
   "tmp_max_age_sec": 3600,
   "status_file": "",
   "status_interval_sec": 5,
@@ -50,5 +53,6 @@
   "sync_hard_resync_ms": 1200,
   "sync_boot_hard_check_sec": 300,
   "sync_checkpoint_interval_sec": 3600,
+  "sync_prep_mode": "play_then_resync",
   "sync_ntp_command": "chronyc -a makestep"
 }

@@ -52,7 +52,9 @@ DEFAULT_CONFIG = {
     "state_dir": "",
     "offline_fallback": True,
     "offline_max_age_hours": 0,
+    "offline_ignore_max_age_when_no_network": True,
     "require_full_download_before_switch": True,
+    "allow_empty_playlist_from_api": False,
     "disable_cleanup_when_offline": True,
     "cache_max_files": 0,
     "cache_max_bytes": 0,
@@ -80,6 +82,7 @@ DEFAULT_CONFIG = {
     "watchdog_interval_sec": 10,
     "playback_stall_sec": 25,
     "playback_mismatch_sec": 10,
+    "media_load_retry_cooldown_sec": 60,
     "tmp_max_age_sec": 3600,
     "status_file": "",
     "status_interval_sec": 5,
@@ -89,6 +92,7 @@ DEFAULT_CONFIG = {
     "sync_hard_resync_ms": 1200,
     "sync_boot_hard_check_sec": 300,
     "sync_checkpoint_interval_sec": 3600,
+    "sync_prep_mode": "play_then_resync",
     "sync_ntp_command": default_sync_ntp_command(),
 }
 
@@ -140,15 +144,36 @@ class PlaylistState:
 
 
 def load_config(path: str) -> Dict:
-    if not os.path.exists(path):
+    abs_path = os.path.abspath(path)
+    if not os.path.exists(abs_path):
         raise FileNotFoundError(f"Config not found: {path}")
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(abs_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(data)
     if not cfg.get("ipc_path"):
         cfg["ipc_path"] = default_ipc_path()
+    config_dir = os.path.dirname(abs_path)
+    for key in ("cache_dir", "state_dir", "log_file", "status_file"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value:
+            cfg[key] = resolve_path_from_base(config_dir, value)
+    ipc_path = cfg.get("ipc_path")
+    if isinstance(ipc_path, str) and ipc_path and not is_windows_named_pipe(ipc_path):
+        cfg["ipc_path"] = resolve_path_from_base(config_dir, ipc_path)
     return cfg
+
+
+def is_windows_named_pipe(path: str) -> bool:
+    return path.startswith("\\\\.\\pipe\\")
+
+
+def resolve_path_from_base(base_dir: str, value: str) -> str:
+    if not value:
+        return value
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    return os.path.normpath(os.path.join(base_dir, value))
 
 
 def setup_logging(cfg: Dict) -> None:
@@ -316,6 +341,27 @@ def run_ntp_sync_command(cfg_snapshot: Dict) -> None:
         logging.warning("Sync prep: sync_ntp_command retornou %s.", result.returncode)
 
 
+def api_endpoint_reachable(cfg: Dict, timeout_sec: float = 2.0) -> bool:
+    api_url = str(cfg.get("api_url") or "").strip()
+    if not api_url:
+        return False
+    parsed = urlparse(api_url)
+    host = parsed.hostname
+    if not host:
+        return False
+    if parsed.port:
+        port = int(parsed.port)
+    elif parsed.scheme == "https":
+        port = 443
+    else:
+        port = 80
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True
+    except Exception:
+        return False
+
+
 def state_dir(cfg: Dict) -> str:
     configured = cfg.get("state_dir")
     if configured:
@@ -381,6 +427,7 @@ def save_playlist_state(cfg: Dict, items: List["MediaItem"], fingerprint: str) -
             {
                 "url": item.url,
                 "duration_ms": item.duration_ms,
+                "path": item.path,
                 "campaign_id": item.campaign_id,
                 "campaign_name": item.campaign_name,
             }
@@ -409,6 +456,10 @@ def saved_playlist_paths(cfg: Dict) -> set:
     for item in raw_items:
         if not isinstance(item, dict):
             continue
+        path = item.get("path")
+        if path and isinstance(path, str) and os.path.exists(path):
+            keep_paths.add(path)
+            continue
         url = item.get("url")
         if not url:
             continue
@@ -425,32 +476,131 @@ def media_items_from_saved(cfg: Dict, raw_items: List[Dict]) -> Tuple[List["Medi
     for item in raw_items:
         if not isinstance(item, dict):
             continue
+        path = item.get("path")
+        if path and isinstance(path, str):
+            resolved_path = path
+        else:
+            resolved_path = ""
         url = item.get("url")
-        if not url:
-            continue
         try:
             duration_ms = int(item.get("duration_ms") or cfg.get("default_duration_ms") or 0)
         except Exception:
             duration_ms = int(cfg.get("default_duration_ms") or 0)
-        path = cache_path(cache_dir, url)
-        if not os.path.exists(path):
+        if duration_ms <= 0:
+            duration_ms = int(cfg.get("default_duration_ms") or 10000)
+        if not resolved_path and url:
+            resolved_path = cache_path(cache_dir, str(url))
+        if not resolved_path or not os.path.exists(resolved_path):
             continue
+        if not is_supported_media_path(resolved_path, allow_bin=bool(url)):
+            continue
+        if (safe_getsize(resolved_path) or 0) <= 0:
+            continue
+        resolved_url = str(url) if url else f"cache://{os.path.basename(resolved_path)}"
         items.append(
             MediaItem(
-                url=str(url),
+                url=resolved_url,
                 duration_ms=duration_ms,
-                path=path,
+                path=resolved_path,
                 campaign_id=str(item.get("campaign_id", "")),
                 campaign_name=str(item.get("campaign_name", "")),
             )
         )
-        fingerprint_items_payload.append({"url": str(url), "duration_ms": duration_ms})
+        fingerprint_items_payload.append({"url": resolved_url, "duration_ms": duration_ms, "path": resolved_path})
     return items, fingerprint_items_payload
 
 
-def offline_playlist_allowed(cfg: Dict, saved_at: Optional[str]) -> bool:
+def media_items_from_cache(
+    cfg: Dict,
+    cache_index: Optional["CacheIndex"] = None,
+) -> Tuple[List["MediaItem"], List[Dict]]:
+    cache_dir = cfg.get("cache_dir") or "."
+    if not os.path.isdir(cache_dir):
+        return [], []
+
+    index_snapshot: Dict[str, Dict[str, object]] = {}
+    if cache_index is not None:
+        try:
+            index_snapshot = cache_index.snapshot()
+        except Exception:
+            index_snapshot = {}
+
+    seen_paths: set = set()
+    candidates: List[Tuple[str, Dict[str, object], float]] = []
+
+    def _add_candidate(path: str, meta: Dict[str, object]) -> None:
+        if path in seen_paths:
+            return
+        if not os.path.isfile(path):
+            return
+        if path.endswith(".tmp"):
+            return
+        if not is_supported_media_path(path, allow_bin=bool(meta.get("url"))):
+            return
+        if (safe_getsize(path) or 0) <= 0:
+            return
+        last_used_ts = None
+        last_used = meta.get("last_used")
+        if isinstance(last_used, str):
+            last_used_ts = parse_iso_utc(last_used)
+        if last_used_ts is None:
+            try:
+                last_used_ts = os.path.getmtime(path)
+            except OSError:
+                last_used_ts = 0.0
+        candidates.append((path, dict(meta), float(last_used_ts)))
+        seen_paths.add(path)
+
+    for path, meta in index_snapshot.items():
+        if isinstance(meta, dict):
+            _add_candidate(path, meta)
+
+    for name in os.listdir(cache_dir):
+        path = os.path.join(cache_dir, name)
+        _add_candidate(path, {})
+
+    candidates.sort(key=lambda entry: (entry[2], entry[0]))
+    default_duration_ms = int(cfg.get("default_duration_ms") or 10000)
+    items: List[MediaItem] = []
+    fingerprint_items_payload: List[Dict] = []
+
+    for path, meta, _ in candidates:
+        raw_duration = meta.get("duration_ms", default_duration_ms)
+        try:
+            duration_ms = int(raw_duration)
+        except Exception:
+            duration_ms = default_duration_ms
+        if duration_ms <= 0:
+            duration_ms = default_duration_ms
+        url = str(meta.get("url") or f"cache://{os.path.basename(path)}")
+        campaign_id = str(meta.get("campaign_id", ""))
+        campaign_name = str(meta.get("campaign_name", ""))
+        items.append(
+            MediaItem(
+                url=url,
+                duration_ms=duration_ms,
+                path=path,
+                campaign_id=campaign_id,
+                campaign_name=campaign_name,
+            )
+        )
+        fingerprint_items_payload.append({"url": url, "duration_ms": duration_ms, "path": path})
+
+    return items, fingerprint_items_payload
+
+
+def offline_playlist_allowed(
+    cfg: Dict,
+    saved_at: Optional[str],
+    network_available: Optional[bool] = None,
+) -> bool:
     max_age_hours = float(cfg.get("offline_max_age_hours") or 0)
     if max_age_hours <= 0:
+        return True
+    if (
+        cfg.get("offline_ignore_max_age_when_no_network", True)
+        and network_available is False
+    ):
         return True
     ref = load_last_success(cfg) or saved_at
     if not ref:
@@ -598,6 +748,11 @@ class StatusState:
             "sync_next_checkpoint_utc": None,
             "sync_checkpoint_reason": None,
             "sync_cycle_ms": None,
+            "playback_state": "starting",
+            "black_screen_risk_reason": None,
+            "blocked_media_count": 0,
+            "last_render_ok": None,
+            "last_render_error": None,
         }
         self.start_time = time.time()
 
@@ -650,6 +805,7 @@ class CacheIndex:
             meta.update(
                 {
                     "url": item.url,
+                    "duration_ms": item.duration_ms,
                     "campaign_id": item.campaign_id,
                     "campaign_name": item.campaign_name,
                     "last_used": iso_now(),
@@ -665,6 +821,7 @@ class CacheIndex:
             meta.update(
                 {
                     "url": item.url,
+                    "duration_ms": item.duration_ms,
                     "campaign_id": item.campaign_id,
                     "campaign_name": item.campaign_name,
                     "last_used": iso_now(),
@@ -699,9 +856,20 @@ def cache_path(cache_dir: str, url: str) -> str:
     return os.path.join(cache_dir, f"{sha1_hex(url)}{ext}")
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".mpeg", ".mpg"}
+
+
 def is_image_path(path: str) -> bool:
     ext = os.path.splitext(path.lower())[1]
-    return ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+    return ext in IMAGE_EXTENSIONS
+
+
+def is_supported_media_path(path: str, allow_bin: bool = False) -> bool:
+    ext = os.path.splitext(path.lower())[1]
+    if ext in IMAGE_EXTENSIONS or ext in VIDEO_EXTENSIONS:
+        return True
+    return allow_bin and ext == ".bin"
 
 
 def fetch_media_list(cfg: Dict) -> List[Dict]:
@@ -888,7 +1056,7 @@ class MPVController:
         self._proc: Optional[subprocess.Popen] = None
         self._ipc = None
         self._ipc_socket = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._ipc_lock = threading.Lock()
         self._request_id = 0
         self._recv_buffer = ""
@@ -937,34 +1105,7 @@ class MPVController:
             self._ipc_socket = False
             self._recv_buffer = ""
 
-    def start(self) -> None:
-        with self._lock:
-            if self._proc and self._proc.poll() is None:
-                return
-            self._close_ipc()
-            self._cleanup_ipc_path()
-            args = build_mpv_args(self._cfg)
-            popen_kwargs = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
-            }
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                popen_kwargs["start_new_session"] = True
-            self._proc = subprocess.Popen(args, **popen_kwargs)
-            self._generation += 1
-            if not self._open_ipc():
-                logging.warning("MPV IPC not available, restarting...")
-                self.restart()
-
-    def restart(self) -> None:
-        with self._lock:
-            self.stop()
-            time.sleep(1)
-            self.start()
-
-    def stop(self) -> None:
+    def _stop_locked(self) -> None:
         self._close_ipc()
         if self._proc and self._proc.poll() is None:
             try:
@@ -983,6 +1124,53 @@ class MPVController:
                     pass
         self._proc = None
         self._cleanup_ipc_path()
+
+    def _start_locked(self) -> bool:
+        if self._proc and self._proc.poll() is None and self._ipc is not None:
+            return True
+        if self._proc and self._proc.poll() is None and self._ipc is None:
+            self._stop_locked()
+
+        self._close_ipc()
+        self._cleanup_ipc_path()
+        args = build_mpv_args(self._cfg)
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            self._proc = subprocess.Popen(args, **popen_kwargs)
+        except Exception as exc:
+            self._proc = None
+            logging.error("Failed to start MPV process: %s", exc)
+            return False
+        self._generation += 1
+        if self._open_ipc():
+            return True
+        logging.warning("MPV IPC not available after launch; will retry.")
+        self._stop_locked()
+        return False
+
+    def start(self) -> None:
+        with self._lock:
+            if self._start_locked():
+                return
+            time.sleep(1)
+            self._start_locked()
+
+    def restart(self) -> None:
+        with self._lock:
+            self._stop_locked()
+            time.sleep(1)
+            self._start_locked()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_locked()
 
     def ensure_running(self) -> None:
         if self._proc is None or self._proc.poll() is not None:
@@ -1097,8 +1285,11 @@ class ConfigServer:
             return
         bind = snapshot.get("config_ui_bind", "127.0.0.1")
         port = int(snapshot.get("config_ui_port", 8765))
-
-        server = ThreadingHTTPServer((bind, port), self._make_handler())
+        try:
+            server = ThreadingHTTPServer((bind, port), self._make_handler())
+        except Exception as exc:
+            logging.warning("Config UI unavailable on %s:%s: %s", bind, port, exc)
+            return
         self._server = server
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1199,12 +1390,59 @@ def poller(
     cache_index: CacheIndex,
     stop_event: threading.Event,
 ) -> None:
+    def wait_poll_interval(cfg_snapshot: Dict) -> None:
+        interval = int(cfg_snapshot.get("poll_interval_sec") or 0)
+        for _ in range(int(interval * 5)):
+            if stop_event.is_set():
+                break
+            if poll_now_event.is_set():
+                poll_now_event.clear()
+                break
+            time.sleep(0.2)
+
     backoff = 2
     consecutive_failures = 0
     while not stop_event.is_set():
         cfg_snapshot = config_snapshot(cfg, cfg_lock)
         try:
             raw_items = fetch_media_list(cfg_snapshot)
+            if not raw_items and not cfg_snapshot.get("allow_empty_playlist_from_api", False):
+                current_items, _ = state.get()
+                if current_items:
+                    logging.warning(
+                        "API returned empty playlist; keeping current playlist (%d items).",
+                        len(current_items),
+                    )
+                    status.update(playlist_size=len(current_items))
+                    status.update(last_poll_success=iso_now(), last_poll_error=None)
+                    save_last_success(cfg_snapshot, iso_now())
+                    consecutive_failures = 0
+                    status.update(consecutive_failures=consecutive_failures)
+                    backoff = 2
+                    wait_poll_interval(cfg_snapshot)
+                    continue
+
+                cache_items, cache_payload = media_items_from_cache(cfg_snapshot, cache_index)
+                if cache_items:
+                    cache_fp = fingerprint_items(cache_payload)
+                    updated = state.update(cache_items, cache_fp)
+                    if updated:
+                        save_playlist_state(cfg_snapshot, cache_items, cache_fp)
+                        logging.warning(
+                            "API returned empty playlist; loaded %d items from local cache.",
+                            len(cache_items),
+                        )
+                    status.update(playlist_size=len(cache_items))
+                    status.update(last_poll_success=iso_now(), last_poll_error=None)
+                    save_last_success(cfg_snapshot, iso_now())
+                    consecutive_failures = 0
+                    status.update(consecutive_failures=consecutive_failures)
+                    backoff = 2
+                    wait_poll_interval(cfg_snapshot)
+                    continue
+
+                raise RuntimeError("API returned empty playlist and no local media is available")
+
             fingerprint = fingerprint_items(raw_items)
             items = download_media(cfg_snapshot, raw_items, cache_index)
             switch_ok = True
@@ -1274,14 +1512,7 @@ def poller(
             time.sleep(backoff)
             backoff = min(backoff * 2, 300)
         else:
-            interval = int(cfg_snapshot.get("poll_interval_sec") or 0)
-            for _ in range(int(interval * 5)):
-                if stop_event.is_set():
-                    break
-                if poll_now_event.is_set():
-                    poll_now_event.clear()
-                    break
-                time.sleep(0.2)
+            wait_poll_interval(cfg_snapshot)
 
 
 def watchdog(
@@ -1583,10 +1814,12 @@ def playback_loop(
     last_version = -1
     preloaded_path: Optional[str] = None
     last_mpv_generation = -1
+    blocked_media_until: Dict[str, float] = {}
 
     boot_wall_ts = time.time()
     boot_mono_ts = time.monotonic()
     pending_soft_resync = False
+    pending_daily_zero_ts: Optional[float] = None
 
     cfg_snapshot = config_snapshot(cfg, cfg_lock)
     sync_enabled = bool(cfg_snapshot.get("sync_enabled", True))
@@ -1594,6 +1827,8 @@ def playback_loop(
     hard_resync_ms = int(cfg_snapshot.get("sync_hard_resync_ms") or 1200)
     checkpoint_interval_sec = int(cfg_snapshot.get("sync_checkpoint_interval_sec") or 3600)
     boot_hard_check_sec = int(cfg_snapshot.get("sync_boot_hard_check_sec") or 300)
+    prep_mode = str(cfg_snapshot.get("sync_prep_mode") or "wait_until_anchor").strip().lower()
+    prep_wait_mode = prep_mode in {"wait", "wait_until_anchor", "hold_until_anchor"}
     boot_hard_check_due_mono: Optional[float] = None
     next_checkpoint_ts: Optional[float] = None
     force_daily_zero_once = False
@@ -1607,24 +1842,39 @@ def playback_loop(
                 sync_last_action="prep_wait_anchor",
             )
             run_ntp_sync_command(cfg_snapshot)
-            wait_sec = max(prep_anchor_ts - time.time(), 0.0)
-            logging.info(
-                "Sync PREP ativo no boot. Aguardando 00:05 UTC por %.2fs para forcar index=0/offset=0.",
-                wait_sec,
-            )
-            while not stop_event.is_set():
-                if time.time() >= prep_anchor_ts:
-                    break
-                time.sleep(0.2)
-            if stop_event.is_set():
-                return
-            force_daily_zero_once = True
-            status.update(
-                sync_mode="running",
-                sync_anchor_utc=iso_from_ts(prep_anchor_ts),
-                sync_last_action="daily_zero_ready",
-            )
-            logging.info("Sync PREP concluido. Player iniciara em index=0/offset=0.")
+            if prep_wait_mode:
+                wait_sec = max(prep_anchor_ts - time.time(), 0.0)
+                status.update(
+                    playback_state="waiting_sync_anchor",
+                    black_screen_risk_reason="sync_prep_wait",
+                )
+                logging.info(
+                    "Sync PREP ativo no boot. Aguardando 00:05 UTC por %.2fs para forcar index=0/offset=0.",
+                    wait_sec,
+                )
+                while not stop_event.is_set():
+                    if time.time() >= prep_anchor_ts:
+                        break
+                    time.sleep(0.2)
+                if stop_event.is_set():
+                    return
+                force_daily_zero_once = True
+                status.update(
+                    sync_mode="running",
+                    sync_anchor_utc=iso_from_ts(prep_anchor_ts),
+                    sync_last_action="daily_zero_ready",
+                    playback_state="starting",
+                    black_screen_risk_reason=None,
+                )
+                logging.info("Sync PREP concluido. Player iniciara em index=0/offset=0.")
+            else:
+                pending_daily_zero_ts = prep_anchor_ts
+                status.update(
+                    sync_mode="running",
+                    sync_anchor_utc=iso_from_ts(prep_anchor_ts),
+                    sync_last_action="prep_play_until_anchor",
+                )
+                logging.info("Sync PREP ativo no boot com modo play_then_resync; tocando ate 00:05 UTC.")
         else:
             status.update(sync_mode="running")
 
@@ -1638,11 +1888,32 @@ def playback_loop(
     while not stop_event.is_set():
         items, version = state.get()
         if not items:
+            status.update(
+                playback_state="waiting_for_media",
+                black_screen_risk_reason="playlist_empty",
+                blocked_media_count=0,
+            )
             time.sleep(1)
             continue
 
         durations_ms, cycle_start_ms, cycle_total_ms = cycle_timeline(items)
         if cycle_total_ms <= 0:
+            status.update(
+                playback_state="waiting_for_media",
+                black_screen_risk_reason="invalid_playlist_timeline",
+            )
+            time.sleep(1)
+            continue
+
+        now_for_block = time.time()
+        blocked_media_until = {p: ts for p, ts in blocked_media_until.items() if ts > now_for_block}
+        blocked_count = sum(1 for media in items if blocked_media_until.get(media.path, 0.0) > now_for_block)
+        if blocked_count >= len(items):
+            status.update(
+                playback_state="waiting_for_media",
+                black_screen_risk_reason="all_media_temporarily_blocked",
+                blocked_media_count=blocked_count,
+            )
             time.sleep(1)
             continue
 
@@ -1657,6 +1928,7 @@ def playback_loop(
             status.update(sync_next_checkpoint_utc=iso_from_ts(next_checkpoint_ts))
         if not sync_enabled:
             pending_soft_resync = False
+            pending_daily_zero_ts = None
             boot_hard_check_due_mono = None
             next_checkpoint_ts = None
             status.update(sync_mode="disabled", sync_cycle_ms=cycle_total_ms)
@@ -1693,6 +1965,10 @@ def playback_loop(
 
         idx = idx % len(items)
         item = items[idx]
+        if blocked_media_until.get(item.path, 0.0) > time.time():
+            idx += 1
+            offset_ms = 0
+            continue
         item_duration_ms = durations_ms[idx]
         next_item = None
         if len(items) > 1:
@@ -1708,18 +1984,34 @@ def playback_loop(
                 logging.warning("Failed to load media, restarting MPV")
                 mpv.restart()
                 if not mpv.load_file(item.path):
-                    time.sleep(1)
+                    cooldown_sec = max(int(cfg_snapshot.get("media_load_retry_cooldown_sec") or 0), 5)
+                    blocked_media_until[item.path] = time.time() + cooldown_sec
+                    status.update(
+                        playback_state="recovering",
+                        black_screen_risk_reason="media_load_failed",
+                        blocked_media_count=len(blocked_media_until),
+                        last_render_error=f"{iso_now()} failed_to_load:{item.path}",
+                    )
+                    idx += 1
+                    offset_ms = 0
+                    time.sleep(0.2)
                     continue
             if offset_ms > 0 and not is_image_path(item.path):
                 offset_seconds = offset_ms / 1000.0
                 if not mpv.seek_absolute(offset_seconds):
                     mpv.set_property("time-pos", offset_seconds)
         preloaded_path = None
+        blocked_media_until.pop(item.path, None)
 
         if next_item is not None and cfg_snapshot.get("preload_next"):
             mpv.append_file(next_item.path)
 
         status.update(
+            playback_state="playing",
+            black_screen_risk_reason=None,
+            blocked_media_count=len(blocked_media_until),
+            last_render_ok=iso_now(),
+            last_render_error=None,
             current_index=idx % len(items),
             current_item={
                 "url": item.url,
@@ -1759,7 +2051,10 @@ def playback_loop(
             check_reason: Optional[str] = None
             now_ts = time.time()
             if sync_enabled:
-                if boot_hard_check_due_mono is not None and now_mono >= boot_hard_check_due_mono:
+                if pending_daily_zero_ts is not None and now_ts >= pending_daily_zero_ts:
+                    check_reason = "daily_zero"
+                    pending_daily_zero_ts = None
+                elif boot_hard_check_due_mono is not None and now_mono >= boot_hard_check_due_mono:
                     check_reason = "boot_5min"
                     boot_hard_check_due_mono = None
                 elif next_checkpoint_ts is not None and now_ts >= next_checkpoint_ts:
@@ -1768,6 +2063,21 @@ def playback_loop(
                     status.update(sync_next_checkpoint_utc=iso_from_ts(next_checkpoint_ts))
 
             if check_reason:
+                if check_reason == "daily_zero":
+                    idx = 0
+                    offset_ms = 0
+                    pending_soft_resync = False
+                    hard_resync_requested = True
+                    preloaded_path = None
+                    status.update(
+                        sync_anchor_utc=iso_from_ts(daily_anchor_utc_ts(now_ts)),
+                        sync_last_check_utc=iso_from_ts(now_ts),
+                        sync_checkpoint_reason=check_reason,
+                        sync_last_action="daily_zero_applied",
+                    )
+                    logging.info("Sync daily zero aplicado em 00:05 UTC (index=0, offset=0).")
+                    break
+
                 sync_pos = compute_cycle_position_from_utc(now_ts, durations_ms)
                 actual_offset_ms = min(offset_ms + elapsed_ms, item_duration_ms)
                 actual_cycle_pos_ms = (current_cycle_start_ms + actual_offset_ms) % sync_pos.cycle_total_ms
@@ -1844,13 +2154,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Kiosky MPV player")
     parser.add_argument("--config", default="config.json", help="Path to config.json")
     args = parser.parse_args()
+    config_path = os.path.abspath(args.config)
 
-    cfg = load_config(args.config)
+    cfg = load_config(config_path)
     setup_logging(cfg)
 
-    if not cfg.get("api_key") or not cfg.get("environment_id"):
-        logging.error("api_key and environment_id must be set in config.json")
-        return 2
+    api_credentials_ready = bool(cfg.get("api_key") and cfg.get("environment_id"))
+    if not api_credentials_ready:
+        logging.warning("API credentials missing; startup will run in offline-only mode if local media is available.")
+    if requests is None:
+        logging.warning("requests dependency unavailable; API polling disabled.")
+    api_polling_enabled = api_credentials_ready and requests is not None
 
     cfg_lock = threading.Lock()
     poll_now_event = threading.Event()
@@ -1864,18 +2178,48 @@ def main() -> int:
     force_exit = threading.Event()
 
     if cfg.get("offline_fallback"):
+        offline_network_available: Optional[bool] = None
+        if (
+            float(cfg.get("offline_max_age_hours") or 0) > 0
+            and cfg.get("offline_ignore_max_age_when_no_network", True)
+        ):
+            offline_network_available = api_endpoint_reachable(cfg, timeout_sec=2.0)
+            if offline_network_available is False:
+                logging.warning("API endpoint unavailable at boot; ignoring offline age limit for startup fallback.")
+
+        loaded_offline = False
         saved_items, _saved_fp, saved_at = load_playlist_state(cfg)
-        if saved_items and offline_playlist_allowed(cfg, saved_at):
+        if saved_items and offline_playlist_allowed(cfg, saved_at, offline_network_available):
             offline_items, fp_payload = media_items_from_saved(cfg, saved_items)
             if offline_items:
                 offline_fp = fingerprint_items(fp_payload)
                 state.update(offline_items, offline_fp)
                 status.update(playlist_size=len(offline_items))
                 logging.info("Loaded offline playlist: %d items", len(offline_items))
+                loaded_offline = True
             else:
                 logging.warning("Offline playlist found but no cached files are available.")
         elif saved_items:
             logging.info("Offline playlist skipped due to max age policy.")
+        if not loaded_offline and offline_playlist_allowed(cfg, None, offline_network_available):
+            cache_items, cache_payload = media_items_from_cache(cfg, cache_index)
+            if cache_items:
+                cache_fp = fingerprint_items(cache_payload)
+                state.update(cache_items, cache_fp)
+                save_playlist_state(cfg, cache_items, cache_fp)
+                status.update(playlist_size=len(cache_items))
+                logging.info("Loaded offline playlist from local cache: %d items", len(cache_items))
+
+    current_items, _current_version = state.get()
+    if not api_polling_enabled and not current_items:
+        if not api_credentials_ready:
+            logging.error("api_key/environment_id ausentes e nenhuma midia offline disponivel.")
+        elif requests is None:
+            logging.error("requests indisponivel e nenhuma midia offline disponivel.")
+        return 2
+    if not api_polling_enabled:
+        status.update(last_poll_error=f"{iso_now()} polling_disabled")
+        logging.warning("API polling disabled; player running with local media only.")
 
     def _force_kill_after_delay() -> None:
         time.sleep(5)
@@ -1901,37 +2245,43 @@ def main() -> int:
 
     mpv.start()
 
-    threads = [
-        threading.Thread(
-            target=poller,
-            args=(cfg, cfg_lock, poll_now_event, state, status, cache_index, stop_event),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=watchdog,
-            args=(cfg, cfg_lock, mpv, status, stop_event),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=status_writer,
-            args=(cfg, cfg_lock, status, stop_event),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=cleanup_worker,
-            args=(cfg, cfg_lock, state, status, cache_index, stop_event),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=telemetry_worker,
-            args=(cfg, cfg_lock, status, stop_event),
-            daemon=True,
-        ),
-    ]
+    threads: List[threading.Thread] = []
+    if api_polling_enabled:
+        threads.append(
+            threading.Thread(
+                target=poller,
+                args=(cfg, cfg_lock, poll_now_event, state, status, cache_index, stop_event),
+                daemon=True,
+            )
+        )
+    threads.extend(
+        [
+            threading.Thread(
+                target=watchdog,
+                args=(cfg, cfg_lock, mpv, status, stop_event),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=status_writer,
+                args=(cfg, cfg_lock, status, stop_event),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=cleanup_worker,
+                args=(cfg, cfg_lock, state, status, cache_index, stop_event),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=telemetry_worker,
+                args=(cfg, cfg_lock, status, stop_event),
+                daemon=True,
+            ),
+        ]
+    )
     for thread in threads:
         thread.start()
 
-    config_server = ConfigServer(cfg, cfg_lock, args.config, mpv, poll_now_event)
+    config_server = ConfigServer(cfg, cfg_lock, config_path, mpv, poll_now_event)
     config_server.start()
 
     try:
