@@ -1,11 +1,12 @@
 import calendar
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-from kiosk import load_config, offline_playlist_allowed
+from kiosk import load_config, media_paths_match, normalize_media_path, offline_playlist_allowed
 
 
 def iso_utc(year: int, month: int, day: int, hour: int, minute: int, second: int) -> str:
@@ -52,6 +53,31 @@ class ResilienceTests(unittest.TestCase):
 
             self.assertTrue(offline_playlist_allowed(cfg, old_saved_at, network_available=False))
             self.assertFalse(offline_playlist_allowed(cfg, old_saved_at, network_available=True))
+
+    def test_normalize_media_path_resolves_relative_path_from_cache_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            media_path = cache_dir / "video.mp4"
+            media_path.write_bytes(b"ok")
+
+            normalized = normalize_media_path(os.path.join("cache", "video.mp4"), str(cache_dir))
+
+            self.assertEqual(normalized, os.path.normpath(str(media_path.absolute())))
+
+    def test_media_paths_match_accepts_relative_and_absolute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            media_path = cache_dir / "video.mp4"
+            media_path.write_bytes(b"ok")
+
+            expected_relative = os.path.join("cache", "video.mp4")
+            actual_absolute = str(media_path.resolve())
+
+            self.assertTrue(media_paths_match(expected_relative, actual_absolute, str(cache_dir)))
 
 
 if __name__ == "__main__":

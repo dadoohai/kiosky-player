@@ -176,6 +176,51 @@ def resolve_path_from_base(base_dir: str, value: str) -> str:
     return os.path.normpath(os.path.join(base_dir, value))
 
 
+def normalize_media_path(path: object, cache_dir: Optional[str] = None) -> Optional[str]:
+    if not isinstance(path, str):
+        return None
+    raw = path.strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        return raw
+
+    candidates: List[str] = []
+    if os.path.isabs(raw):
+        candidates.append(raw)
+    else:
+        candidates.append(os.path.abspath(raw))
+        if cache_dir:
+            candidates.append(os.path.abspath(os.path.join(cache_dir, raw)))
+            candidates.append(os.path.abspath(os.path.join(cache_dir, os.path.basename(raw))))
+
+    seen: set = set()
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.exists(normalized):
+            return normalized
+
+    if candidates:
+        return os.path.normpath(candidates[0])
+    return None
+
+
+def media_paths_match(expected_path: object, actual_path: object, cache_dir: Optional[str] = None) -> bool:
+    expected = normalize_media_path(expected_path, cache_dir)
+    actual = normalize_media_path(actual_path, cache_dir)
+    if not expected or not actual:
+        return False
+    if "://" not in expected and "://" not in actual:
+        if os.path.exists(expected):
+            expected = os.path.realpath(expected)
+        if os.path.exists(actual):
+            actual = os.path.realpath(actual)
+    return os.path.normcase(expected) == os.path.normcase(actual)
+
+
 def setup_logging(cfg: Dict) -> None:
     level = logging.INFO
     handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
@@ -456,8 +501,8 @@ def saved_playlist_paths(cfg: Dict) -> set:
     for item in raw_items:
         if not isinstance(item, dict):
             continue
-        path = item.get("path")
-        if path and isinstance(path, str) and os.path.exists(path):
+        path = normalize_media_path(item.get("path"), cache_dir)
+        if path and os.path.exists(path):
             keep_paths.add(path)
             continue
         url = item.get("url")
@@ -476,11 +521,7 @@ def media_items_from_saved(cfg: Dict, raw_items: List[Dict]) -> Tuple[List["Medi
     for item in raw_items:
         if not isinstance(item, dict):
             continue
-        path = item.get("path")
-        if path and isinstance(path, str):
-            resolved_path = path
-        else:
-            resolved_path = ""
+        resolved_path = normalize_media_path(item.get("path"), cache_dir) or ""
         url = item.get("url")
         try:
             duration_ms = int(item.get("duration_ms") or cfg.get("default_duration_ms") or 0)
@@ -489,7 +530,7 @@ def media_items_from_saved(cfg: Dict, raw_items: List[Dict]) -> Tuple[List["Medi
         if duration_ms <= 0:
             duration_ms = int(cfg.get("default_duration_ms") or 10000)
         if not resolved_path and url:
-            resolved_path = cache_path(cache_dir, str(url))
+            resolved_path = normalize_media_path(cache_path(cache_dir, str(url)), cache_dir) or ""
         if not resolved_path or not os.path.exists(resolved_path):
             continue
         if not is_supported_media_path(resolved_path, allow_bin=bool(url)):
@@ -1537,21 +1578,32 @@ def watchdog(
         cfg_snapshot = config_snapshot(cfg, cfg_lock)
         stall_sec = int(cfg_snapshot.get("playback_stall_sec") or 0)
         mismatch_sec = int(cfg_snapshot.get("playback_mismatch_sec") or 0)
+        cache_dir = cfg_snapshot.get("cache_dir")
         status_snapshot = status.snapshot()
         current_item = status_snapshot.get("current_item") or {}
+        next_item = status_snapshot.get("next_item") or {}
         expected_path = current_item.get("path") if isinstance(current_item, dict) else None
+        expected_paths: List[str] = []
+        if isinstance(current_item, dict) and isinstance(current_item.get("path"), str):
+            expected_paths.append(current_item["path"])
+        if isinstance(next_item, dict) and isinstance(next_item.get("path"), str):
+            expected_paths.append(next_item["path"])
         if mismatch_sec <= 0:
             last_path_mismatch_at = None
-        elif expected_path:
+        elif expected_paths:
             actual_path = mpv.get_property("path")
             if isinstance(actual_path, str):
-                if os.path.normpath(actual_path) != os.path.normpath(expected_path):
+                has_path_match = any(
+                    media_paths_match(candidate, actual_path, cache_dir)
+                    for candidate in expected_paths
+                )
+                if not has_path_match:
                     if last_path_mismatch_at is None:
                         last_path_mismatch_at = time.time()
                     elif time.time() - last_path_mismatch_at > mismatch_sec:
                         logging.warning(
-                            "MPV path mismatch (expected %s, got %s), restarting",
-                            expected_path,
+                            "MPV path mismatch (expected one of %s, got %s), restarting",
+                            expected_paths,
                             actual_path,
                         )
                         mpv.restart()
