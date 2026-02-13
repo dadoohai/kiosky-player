@@ -5,6 +5,7 @@ from kiosk import (
     classify_drift_action,
     compute_cycle_position_from_utc,
     daily_anchor_utc_ts,
+    ensure_pending_daily_zero_ts,
     is_prep_window_utc,
     next_hour_checkpoint_utc_ts,
     signed_cycle_delta_ms,
@@ -45,6 +46,21 @@ class SyncRulesTests(unittest.TestCase):
         self.assertEqual(classify_drift_action(100, 300, 1200), "none")
         self.assertEqual(classify_drift_action(350, 300, 1200), "soft_resync")
         self.assertEqual(classify_drift_action(-1200, 300, 1200), "hard_resync")
+        self.assertEqual(classify_drift_action(0, 0, 1200), "none")
+        self.assertEqual(classify_drift_action(1, 0, 1200), "soft_resync")
+
+    def test_ensure_pending_daily_zero_ts(self) -> None:
+        now_ts = utc_ts(2026, 2, 8, 14, 10, 0)
+        expected_next = utc_ts(2026, 2, 9, 0, 5, 0)
+        self.assertEqual(ensure_pending_daily_zero_ts(now_ts, None), expected_next)
+        self.assertEqual(
+            ensure_pending_daily_zero_ts(now_ts, utc_ts(2026, 2, 8, 23, 0, 0)),
+            utc_ts(2026, 2, 8, 23, 0, 0),
+        )
+        self.assertEqual(
+            ensure_pending_daily_zero_ts(now_ts, utc_ts(2026, 2, 8, 0, 5, 0)),
+            expected_next,
+        )
 
     def test_next_hour_checkpoint_rounds_up(self) -> None:
         now_ts = utc_ts(2026, 2, 8, 10, 15, 1)

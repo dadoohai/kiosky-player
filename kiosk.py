@@ -302,6 +302,10 @@ def classify_drift_action(
     threshold = max(int(drift_threshold_ms), 0)
     hard = max(int(hard_resync_ms), threshold)
     abs_drift = abs(int(drift_ms))
+    if abs_drift == 0:
+        return "none"
+    if threshold <= 0:
+        return "hard_resync" if abs_drift >= hard else "soft_resync"
     if abs_drift < threshold:
         return "none"
     if abs_drift >= hard:
@@ -314,6 +318,12 @@ def next_hour_checkpoint_utc_ts(now_ts: float, interval_sec: int = 3600) -> floa
         interval_sec = 3600
     now_int = int(now_ts)
     return float(((now_int // interval_sec) + 1) * interval_sec)
+
+
+def ensure_pending_daily_zero_ts(now_ts: float, pending_daily_zero_ts: Optional[float]) -> float:
+    if pending_daily_zero_ts is not None and pending_daily_zero_ts > now_ts:
+        return float(pending_daily_zero_ts)
+    return next_daily_anchor_utc_ts(now_ts)
 
 
 def run_ntp_sync_command(cfg_snapshot: Dict) -> None:
@@ -1879,6 +1889,8 @@ def playback_loop(
         if sync_enabled and next_checkpoint_ts is None:
             next_checkpoint_ts = next_hour_checkpoint_utc_ts(time.time(), checkpoint_interval_sec)
             status.update(sync_next_checkpoint_utc=iso_from_ts(next_checkpoint_ts))
+        if sync_enabled:
+            pending_daily_zero_ts = ensure_pending_daily_zero_ts(time.time(), pending_daily_zero_ts)
         if not sync_enabled:
             pending_soft_resync = False
             pending_daily_zero_ts = None
@@ -2006,7 +2018,7 @@ def playback_loop(
             if sync_enabled:
                 if pending_daily_zero_ts is not None and now_ts >= pending_daily_zero_ts:
                     check_reason = "daily_zero"
-                    pending_daily_zero_ts = None
+                    pending_daily_zero_ts = next_daily_anchor_utc_ts(now_ts)
                 elif boot_hard_check_due_mono is not None and now_mono >= boot_hard_check_due_mono:
                     check_reason = "boot_5min"
                     boot_hard_check_due_mono = None
