@@ -719,12 +719,13 @@ def send_telemetry(
         uptime_seconds=uptime_seconds,
     )
     try:
-        requests.post(
+        response = requests.post(
             url,
             json=payload,
             headers=headers,
             timeout=int(cfg_snapshot.get("telemetry_timeout_sec") or 10),
         )
+        response.raise_for_status()
         return True
     except Exception as exc:
         logging.warning("Telemetry failed: %s", exc)
