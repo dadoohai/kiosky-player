@@ -66,8 +66,6 @@ Opcional no `config.json`:
 - `telemetry_enabled`: true/false
 - `telemetry_interval_sec`: 300 (5 min)
 - `telemetry_url` e `station_id`
-- `playback_stall_sec`: reinicia MPV se o tempo de reprodução travar (0 desativa)
-- `playback_mismatch_sec`: reinicia MPV se o arquivo atual não trocar (0 desativa)
 - `media_load_retry_cooldown_sec`: cooldown para tentar novamente midia que falhou ao carregar
 - `tmp_max_age_sec`: remove downloads temporários antigos do cache
 - `sync_enabled`: ativa sincronismo global por UTC
