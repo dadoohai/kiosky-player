@@ -31,6 +31,10 @@ def default_ipc_path() -> str:
     return os.path.join(tempfile.gettempdir(), "mpv-kiosk.sock")
 
 
+def default_runtime_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), "kiosky")
+
+
 def default_sync_ntp_command() -> str:
     if sys.platform.startswith("linux"):
         return "chronyc -a makestep"
@@ -38,7 +42,7 @@ def default_sync_ntp_command() -> str:
 
 
 DEFAULT_CONFIG = {
-    "api_url": "https://us-central1-habitat-19883.cloudfunctions.net/api/search",
+    "api_url": "https://api.example.invalid/search",
     "api_key": "",
     "environment_id": "",
     "only_standby": True,
@@ -58,8 +62,11 @@ DEFAULT_CONFIG = {
     "disable_cleanup_when_offline": True,
     "cache_max_files": 0,
     "cache_max_bytes": 0,
+    "min_free_space_bytes": 512 * 1024 * 1024,
+    "max_download_bytes": 512 * 1024 * 1024,
     "mpv_path": "mpv",
     "ipc_path": default_ipc_path(),
+    "runtime_dir": default_runtime_dir(),
     "rotation_deg": 0,
     "hotkeys_enabled": True,
     "hotkey_open_key": "Ctrl+s",
@@ -67,8 +74,9 @@ DEFAULT_CONFIG = {
     "config_ui_bind": "127.0.0.1",
     "config_ui_port": 8765,
     "low_resource_mode": False,
-    "telemetry_enabled": True,
-    "telemetry_url": "https://api.dadooh.ai/api/v1/interact/telemetry",
+    "telemetry_enabled": False,
+    "telemetry_url": "https://telemetry.example.invalid/telemetry",
+    "telemetry_token": "",
     "telemetry_interval_sec": 60,
     "telemetry_timeout_sec": 10,
     "station_id": "",
@@ -152,7 +160,7 @@ def load_config(path: str) -> Dict:
     if not cfg.get("ipc_path"):
         cfg["ipc_path"] = default_ipc_path()
     config_dir = os.path.dirname(abs_path)
-    for key in ("cache_dir", "state_dir", "log_file", "status_file"):
+    for key in ("cache_dir", "state_dir", "log_file", "status_file", "runtime_dir"):
         value = cfg.get(key)
         if isinstance(value, str) and value:
             cfg[key] = resolve_path_from_base(config_dir, value)
@@ -688,6 +696,11 @@ def build_telemetry_payload(
     return payload
 
 
+def telemetry_token(cfg_snapshot: Dict) -> str:
+    token = cfg_snapshot.get("telemetry_token") or os.environ.get("KIOSKY_TELEMETRY_TOKEN", "")
+    return str(token).strip()
+
+
 def send_telemetry(
     cfg_snapshot: Dict,
     status_snapshot: Dict[str, Optional[object]],
@@ -705,9 +718,11 @@ def send_telemetry(
     url = cfg_snapshot.get("telemetry_url")
     if not url:
         return False
-    headers = {
-        "x-interact-telemetry-token": "540fca561dcb494287e8f820381c0e0f",
-    }
+    token = telemetry_token(cfg_snapshot)
+    if not token:
+        logging.info("Telemetry enabled but no telemetry token is configured; skipping.")
+        return False
+    headers = {"x-interact-telemetry-token": token}
     payload = build_telemetry_payload(
         cfg_snapshot,
         status_snapshot,
@@ -865,6 +880,29 @@ def cache_path(cache_dir: str, url: str) -> str:
     return os.path.join(cache_dir, f"{sha1_hex(url)}{ext}")
 
 
+def positive_int_config(cfg: Dict, key: str) -> int:
+    try:
+        value = int(cfg.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, value)
+
+
+def free_space_bytes(path: str) -> int:
+    stat = os.statvfs(path)
+    return int(stat.f_bavail) * int(stat.f_frsize)
+
+
+def ensure_download_space(cache_dir: str, download_bytes: int, min_free_space_bytes: int) -> None:
+    available = free_space_bytes(cache_dir)
+    required = download_bytes + min_free_space_bytes
+    if available < required:
+        raise IOError(
+            f"Insufficient free space for download "
+            f"({available} available, {download_bytes} needed, {min_free_space_bytes} reserved)"
+        )
+
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".mpeg", ".mpg"}
 
@@ -930,11 +968,14 @@ def fetch_media_list(cfg: Dict) -> List[Dict]:
 def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[CacheIndex]) -> List[MediaItem]:
     os.makedirs(cfg["cache_dir"], exist_ok=True)
     items: List[MediaItem] = []
+    min_free_space_bytes = positive_int_config(cfg, "min_free_space_bytes")
+    max_download_bytes = positive_int_config(cfg, "max_download_bytes")
 
     for item in raw_items:
         url = item["url"]
         dest = cache_path(cfg["cache_dir"], url)
         if not os.path.exists(dest):
+            tmp_path = f"{dest}.tmp"
             try:
                 logging.info("Downloading %s", url)
                 resp = requests.get(url, stream=True, timeout=cfg["request_timeout_sec"])
@@ -943,20 +984,28 @@ def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[Cache
                 content_length = resp.headers.get("Content-Length")
                 if content_length and content_length.isdigit():
                     expected_size = int(content_length)
-                tmp_path = f"{dest}.tmp"
+                if expected_size is not None:
+                    if max_download_bytes and expected_size > max_download_bytes:
+                        raise IOError(f"Download exceeds max_download_bytes ({expected_size}/{max_download_bytes})")
+                    ensure_download_space(cfg["cache_dir"], expected_size, min_free_space_bytes)
                 bytes_written = 0
                 with open(tmp_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=1024 * 256):
                         if chunk:
+                            if max_download_bytes and bytes_written + len(chunk) > max_download_bytes:
+                                raise IOError(
+                                    f"Download exceeds max_download_bytes ({bytes_written + len(chunk)}/{max_download_bytes})"
+                                )
                             fh.write(chunk)
                             bytes_written += len(chunk)
                 if expected_size is not None and bytes_written < expected_size:
                     raise IOError(f"Incomplete download ({bytes_written}/{expected_size} bytes)")
+                if expected_size is not None and bytes_written > expected_size:
+                    raise IOError(f"Download size mismatch ({bytes_written}/{expected_size} bytes)")
                 os.replace(tmp_path, dest)
             except Exception as exc:
                 logging.warning("Failed to download %s: %s", url, exc)
                 try:
-                    tmp_path = f"{dest}.tmp"
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
                 except Exception as cleanup_exc:
@@ -1001,7 +1050,7 @@ def build_open_command(cfg: Dict) -> List[str]:
 def ensure_hotkey_conf(cfg: Dict) -> Optional[str]:
     if not cfg.get("hotkeys_enabled"):
         return None
-    runtime_dir = os.path.join(".", "runtime")
+    runtime_dir = cfg.get("runtime_dir") or default_runtime_dir()
     os.makedirs(runtime_dir, exist_ok=True)
     conf_path = os.path.join(runtime_dir, "hotkeys.conf")
     cmd = build_open_command(cfg)

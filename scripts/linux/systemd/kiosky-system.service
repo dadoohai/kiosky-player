@@ -1,0 +1,22 @@
+[Unit]
+Description=Kiosky MPV Player (system service)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=totem
+Group=totem
+WorkingDirectory=/opt/totem/kiosky-player
+# Display stack is intentionally defined during integration.
+# Add DISPLAY/WAYLAND/session environment only after validating the final compositor.
+ExecStart=/opt/totem/venv/bin/python /opt/totem/kiosky-player/kiosk.py --config /data/config/config.json
+Restart=on-failure
+RestartSec=10
+ReadOnlyPaths=/opt/totem
+ReadWritePaths=/data /tmp
+
+[Install]
+WantedBy=multi-user.target

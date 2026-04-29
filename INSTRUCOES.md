@@ -62,9 +62,11 @@ Recomendacoes de midia:
 
 ## Telemetria (a cada 5 min)
 
-- Envia healthcheck para `https://api.dadooh.ai/api/v1/interact/telemetry`.
+- Envia healthcheck para a URL configurada em `telemetry_url`.
 - No `config.json`:
   - `telemetry_enabled`: true/false
+  - `telemetry_url`: endpoint de telemetria do ambiente
+  - `telemetry_token`: vazio ou preenchido apenas no config local/provisionado
   - `telemetry_interval_sec`: 300
   - `station_id`: identificacao do totem (opcional)
 

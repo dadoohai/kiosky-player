@@ -8,7 +8,8 @@ Este projeto cria um player kiosk que busca midias em uma API, faz polling para 
 - MPV instalado no sistema
   - macOS: `brew install mpv`
   - Windows: baixe do site oficial ou use `choco install mpv`
-  - Linux/Orange Pi: `sudo apt install mpv`
+  - Linux desktop/dev: use o gerenciador de pacotes da distribuicao
+  - Orange Pi de producao: nao rode scripts de install/deps diretamente na placa; dependencias devem vir da imagem/provisionamento de integracao
 
 ## Configuracao
 
@@ -19,6 +20,12 @@ Este projeto cria um player kiosk que busca midias em uma API, faz polling para 
 4. `ipc_path` vazio usa um padrao automatico (socket no Linux/macOS, named pipe no Windows).
 5. Para status/monitoramento, defina `status_file` (JSON) e `status_interval_sec`.
 6. Caminhos relativos (`cache_dir`, `state_dir`, `log_file`, `status_file`, `ipc_path`) sao resolvidos em relacao a pasta do `config.json`.
+
+### Perfil appliance
+
+`config.appliance.example.json` e um exemplo conservador para Orange Pi em modo appliance. Ele usa cache e estado em `/data`, runtime/status/IPC em `/tmp`, desativa hotkeys, UI de configuracao, telemetria, sync NTP e preload, limita cache a 2 GiB/200 arquivos e reserva espaco livre antes de downloads.
+
+Copie esse arquivo para o caminho de configuracao provisionado pela integracao, por exemplo `/data/config/config.json`, e preencha somente placeholders seguros como `api_url`, `api_key`, `environment_id` e `station_id`. Nao coloque tokens reais no repositório; `telemetry_token` pode vir do config local ou da variavel `KIOSKY_TELEMETRY_TOKEN`.
 
 ## Rodar localmente
 
@@ -130,6 +137,12 @@ powershell -ExecutionPolicy Bypass -File scripts/install/deps.ps1
   - Variaveis opcionais: `PYTHON_BIN` e `CONFIG_PATH` (Linux/macOS) ou `-Python`/`-Config` (Windows).
 
 ### Linux / Orange Pi (systemd)
+
+O arquivo historico `scripts/linux/systemd/kiosky.service` e um service de usuario para instalacoes locais. Para a Orange Pi em modo appliance, revise `scripts/linux/systemd/kiosky-system.service`: ele e um service de sistema com `User=totem`, app em `/opt/totem/kiosky-player`, config em `/data/config/config.json`, `/opt/totem` somente leitura e escrita limitada a `/data` e `/tmp`.
+
+Nao instale automaticamente nesta etapa. A stack de display ainda deve ser definida na integracao.
+
+Para o service de usuario local:
 
 1. Copie `scripts/linux/systemd/kiosky.service` para `~/.config/systemd/user/`.
 2. Ajuste `ExecStart` e `WorkingDirectory`.

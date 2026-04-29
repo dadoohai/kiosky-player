@@ -1,4 +1,6 @@
+import os
 import unittest
+from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import patch
 
@@ -38,6 +40,7 @@ def sample_cfg() -> Dict[str, Any]:
     return {
         "telemetry_enabled": True,
         "telemetry_url": "http://127.0.0.1:9999/telemetry",
+        "telemetry_token": "test-telemetry-token",
         "telemetry_timeout_sec": 7,
         "environment_id": "env-1",
         "station_id": "station-1",
@@ -64,7 +67,7 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(len(fake_requests.calls), 1)
         sent = fake_requests.calls[0]
         self.assertEqual(sent["timeout"], 7)
-        self.assertEqual(sent["headers"]["x-interact-telemetry-token"], "540fca561dcb494287e8f820381c0e0f")
+        self.assertEqual(sent["headers"]["x-interact-telemetry-token"], "test-telemetry-token")
         self.assertEqual(sent["json"]["environmentId"], "env-1")
         self.assertEqual(sent["json"]["stationId"], "station-1")
         self.assertEqual(sent["json"]["heartbeatType"], "healthcheck")
@@ -99,6 +102,31 @@ class TelemetryTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(fake_requests.calls, [])
+
+    def test_send_telemetry_without_token_does_not_send(self) -> None:
+        fake_requests = FakeRequests()
+        cfg = sample_cfg()
+        cfg["telemetry_token"] = ""
+        with patch.dict(os.environ, {}, clear=True), patch.object(kiosk, "requests", fake_requests):
+            ok = kiosk.send_telemetry(cfg, sample_status(), heartbeat_type="healthcheck")
+
+        self.assertFalse(ok)
+        self.assertEqual(fake_requests.calls, [])
+
+    def test_send_telemetry_can_use_env_token(self) -> None:
+        fake_requests = FakeRequests(response=FakeResponse())
+        cfg = sample_cfg()
+        cfg["telemetry_token"] = ""
+        with patch.dict(os.environ, {"KIOSKY_TELEMETRY_TOKEN": "env-telemetry-token"}, clear=True):
+            with patch.object(kiosk, "requests", fake_requests):
+                ok = kiosk.send_telemetry(cfg, sample_status(), heartbeat_type="healthcheck")
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_requests.calls[0]["headers"]["x-interact-telemetry-token"], "env-telemetry-token")
+
+    def test_no_hardcoded_telemetry_header_token_in_source(self) -> None:
+        source = Path(kiosk.__file__).read_text(encoding="utf-8")
+        self.assertNotRegex(source, r'"x-interact-telemetry-token"\s*:\s*["\'][^"\']+["\']')
 
 
 if __name__ == "__main__":
