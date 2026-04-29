@@ -5,8 +5,9 @@ import kiosk
 
 
 class FakeMPV:
-    def __init__(self, ping_results, stop_event):
+    def __init__(self, ping_results, stop_event, generations=None):
         self.ping_results = list(ping_results)
+        self.generations = list(generations or [7])
         self.stop_event = stop_event
         self.restart_reasons = []
         self.ping_calls = 0
@@ -31,19 +32,20 @@ class FakeMPV:
         return True
 
     def generation(self) -> int:
-        return 7
+        generation_index = min(self.ping_calls, len(self.generations) - 1)
+        return self.generations[generation_index]
 
     def pid(self) -> int:
         return 1234
 
     def current_log_file(self) -> str:
-        return "/tmp/kiosky/mpv-g007.log"
+        return f"/tmp/kiosky/mpv-g{self.generation():03d}.log"
 
 
 class WatchdogTests(unittest.TestCase):
-    def run_watchdog_once(self, ping_results, cfg=None):
+    def run_watchdog_once(self, ping_results, cfg=None, generations=None):
         stop_event = threading.Event()
-        mpv = FakeMPV(ping_results, stop_event)
+        mpv = FakeMPV(ping_results, stop_event, generations=generations)
         watchdog_cfg = {
             "watchdog_interval_sec": 0,
             "mpv_ipc_timeout_sec": 2.0,
@@ -94,6 +96,34 @@ class WatchdogTests(unittest.TestCase):
         )
 
         self.assertEqual(mpv.restart_reasons, [])
+
+    def test_generation_change_between_failures_prevents_restart(self) -> None:
+        mpv, _status = self.run_watchdog_once(
+            [False, False],
+            {"mpv_watchdog_ping_failures_before_restart": 2},
+            generations=[7, 8],
+        )
+
+        self.assertEqual(mpv.restart_reasons, [])
+
+    def test_generation_change_reset_is_logged(self) -> None:
+        with self.assertLogs(level="INFO") as logs:
+            self.run_watchdog_once(
+                [False, False],
+                {"mpv_watchdog_ping_failures_before_restart": 2},
+                generations=[7, 8],
+            )
+
+        self.assertIn("counter reset after generation change", "\n".join(logs.output))
+
+    def test_successful_ping_reset_is_logged(self) -> None:
+        with self.assertLogs(level="INFO") as logs:
+            self.run_watchdog_once(
+                [False, True],
+                {"mpv_watchdog_ping_failures_before_restart": 2},
+            )
+
+        self.assertIn("MPV IPC ping recovered", "\n".join(logs.output))
 
     def test_invalid_threshold_values_fall_back_to_one(self) -> None:
         for value in (0, -1, "invalid", None):

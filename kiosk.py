@@ -2005,13 +2005,35 @@ def watchdog(
     stop_event: threading.Event,
 ) -> None:
     consecutive_ping_failures = 0
+    ping_failure_generation: Optional[int] = None
     while not stop_event.is_set():
         try:
             mpv.ensure_running()
             cfg_snapshot = config_snapshot(cfg, cfg_lock)
             timeout_sec = positive_float_config(cfg_snapshot, "mpv_ipc_timeout_sec", 2.0)
             threshold = watchdog_ping_failure_threshold(cfg_snapshot)
+            current_generation = mpv.generation()
+            current_pid = mpv.pid() or "none"
+            current_log_file = mpv.current_log_file() or "none"
+            if (
+                consecutive_ping_failures
+                and ping_failure_generation is not None
+                and ping_failure_generation != current_generation
+            ):
+                logging.info(
+                    "MPV IPC ping failure counter reset after generation change consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f previous_generation=%d generation=%d pid=%s log_file=%s",
+                    consecutive_ping_failures,
+                    threshold,
+                    timeout_sec,
+                    ping_failure_generation,
+                    current_generation,
+                    current_pid,
+                    current_log_file,
+                )
+                consecutive_ping_failures = 0
+                ping_failure_generation = None
             if not mpv.ping():
+                ping_failure_generation = current_generation
                 consecutive_ping_failures += 1
                 if consecutive_ping_failures < threshold:
                     logging.warning(
@@ -2019,9 +2041,9 @@ def watchdog(
                         consecutive_ping_failures,
                         threshold,
                         timeout_sec,
-                        mpv.generation(),
-                        mpv.pid() or "none",
-                        mpv.current_log_file() or "none",
+                        current_generation,
+                        current_pid,
+                        current_log_file,
                     )
                 else:
                     logging.warning(
@@ -2029,12 +2051,13 @@ def watchdog(
                         consecutive_ping_failures,
                         threshold,
                         timeout_sec,
-                        mpv.generation(),
-                        mpv.pid() or "none",
-                        mpv.current_log_file() or "none",
+                        current_generation,
+                        current_pid,
+                        current_log_file,
                     )
                     mpv.restart(reason="ipc_unresponsive")
                     consecutive_ping_failures = 0
+                    ping_failure_generation = None
             else:
                 if consecutive_ping_failures:
                     logging.info(
@@ -2042,11 +2065,12 @@ def watchdog(
                         consecutive_ping_failures,
                         threshold,
                         timeout_sec,
-                        mpv.generation(),
-                        mpv.pid() or "none",
-                        mpv.current_log_file() or "none",
+                        current_generation,
+                        current_pid,
+                        current_log_file,
                     )
                 consecutive_ping_failures = 0
+                ping_failure_generation = None
             status.update(mpv_running=mpv.is_running(), mpv_last_ok=iso_now())
         except Exception as exc:
             logging.warning("Watchdog error: %s", exc)
