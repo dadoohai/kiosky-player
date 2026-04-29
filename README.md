@@ -23,7 +23,7 @@ Este projeto cria um player kiosk que busca midias em uma API, faz polling para 
 
 ### Perfil appliance
 
-`config.appliance.example.json` e um exemplo conservador para Orange Pi em modo appliance. Ele usa cache e estado em `/data`, runtime/status/IPC em `/tmp`, desativa hotkeys, UI de configuracao, telemetria, sync NTP e preload, limita cache a 2 GiB/200 arquivos e reserva espaco livre antes de downloads.
+`config.appliance.example.json` e um exemplo conservador para Orange Pi em modo appliance. Ele usa cache e estado em `/data`, runtime/status/IPC em `/tmp`, desativa hotkeys, UI de configuracao, telemetria, sync NTP e preload, limita cache a 2 GiB/200 arquivos e reserva espaco livre antes de downloads. O perfil ativa `strict_paths_enabled`, que falha cedo se os caminhos mutaveis sairem de `/data` ou `/tmp`.
 
 Copie esse arquivo para o caminho de configuracao provisionado pela integracao, por exemplo `/data/config/config.json`, e preencha somente placeholders seguros como `api_url`, `api_key`, `environment_id` e `station_id`. Nao coloque tokens reais no repositório; `telemetry_token` pode vir do config local ou da variavel `KIOSKY_TELEMETRY_TOKEN`.
 
@@ -70,6 +70,9 @@ Opcional no `config.json`:
 - `allow_empty_playlist_from_api`: true/false (false = ignora resposta vazia da API e mantem playlist atual)
 - `disable_cleanup_when_offline`: true/false (nao limpa cache quando offline)
 - `cache_max_files` / `cache_max_bytes`: limites para limpeza por LRU (0 = desativado)
+- `min_free_space_bytes`: reserva minima de espaco livre antes de downloads
+- `max_download_bytes`: teto para downloads sem `Content-Length`; `0` recusa downloads sem tamanho declarado
+- `strict_paths_enabled`: valida perfil appliance (`cache_dir`/`state_dir` em `/data`, runtime/status/IPC em `/tmp`, `log_file` vazio ou em `/data/logs`)
 - `telemetry_enabled`: true/false
 - `telemetry_interval_sec`: 300 (5 min)
 - `telemetry_url` e `station_id`

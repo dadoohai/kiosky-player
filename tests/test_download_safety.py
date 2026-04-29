@@ -119,6 +119,37 @@ class DownloadSafetyTests(unittest.TestCase):
             self.assertFalse(dest.exists())
             self.assertFalse(Path(f"{dest}.tmp").exists())
 
+    def test_unknown_content_length_larger_than_simulated_space_is_rejected_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.example.invalid/unknown-space.mp4"
+            dest = Path(kiosk.cache_path(str(cache_dir), url))
+            response = FakeDownloadResponse(chunks=[b"abc"])
+            fake_requests = FakeDownloadRequests(response)
+
+            with patch.object(kiosk, "requests", fake_requests):
+                with patch.object(kiosk.os, "statvfs", return_value=FakeStatvfs(available_bytes=14)):
+                    items = kiosk.download_media(download_cfg(cache_dir, min_free=10, max_download=5), [raw_item(url)], None)
+
+            self.assertEqual(items, [])
+            self.assertFalse(dest.exists())
+            self.assertFalse(Path(f"{dest}.tmp").exists())
+
+    def test_unknown_content_length_is_rejected_when_max_download_is_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.example.invalid/no-limit.mp4"
+            dest = Path(kiosk.cache_path(str(cache_dir), url))
+            response = FakeDownloadResponse(chunks=[b"abc"])
+            fake_requests = FakeDownloadRequests(response)
+
+            with patch.object(kiosk, "requests", fake_requests):
+                items = kiosk.download_media(download_cfg(cache_dir, max_download=0), [raw_item(url)], None)
+
+            self.assertEqual(items, [])
+            self.assertFalse(dest.exists())
+            self.assertFalse(Path(f"{dest}.tmp").exists())
+
     def test_existing_final_file_is_not_replaced(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir)

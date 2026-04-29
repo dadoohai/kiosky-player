@@ -24,6 +24,7 @@
   "mpv_path": "mpv",
   "ipc_path": "",
   "runtime_dir": "",
+  "strict_paths_enabled": false,
   "rotation_deg": 0,
   "hotkeys_enabled": true,
   "hotkey_open_key": "Ctrl+s",

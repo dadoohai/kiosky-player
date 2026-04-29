@@ -24,6 +24,7 @@
   "mpv_path": "mpv",
   "ipc_path": "/tmp/kiosky/mpv.sock",
   "runtime_dir": "/tmp/kiosky",
+  "strict_paths_enabled": true,
   "rotation_deg": 0,
   "hotkeys_enabled": false,
   "hotkey_open_key": "Ctrl+s",

@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "mpv_path": "mpv",
     "ipc_path": default_ipc_path(),
     "runtime_dir": default_runtime_dir(),
+    "strict_paths_enabled": False,
     "rotation_deg": 0,
     "hotkeys_enabled": True,
     "hotkey_open_key": "Ctrl+s",
@@ -167,6 +168,7 @@ def load_config(path: str) -> Dict:
     ipc_path = cfg.get("ipc_path")
     if isinstance(ipc_path, str) and ipc_path and not is_windows_named_pipe(ipc_path):
         cfg["ipc_path"] = resolve_path_from_base(config_dir, ipc_path)
+    validate_strict_paths(cfg)
     return cfg
 
 
@@ -180,6 +182,35 @@ def resolve_path_from_base(base_dir: str, value: str) -> str:
     if os.path.isabs(value):
         return os.path.normpath(value)
     return os.path.normpath(os.path.join(base_dir, value))
+
+
+def path_is_under(path: str, root: str) -> bool:
+    normalized_path = os.path.abspath(os.path.normpath(path))
+    normalized_root = os.path.abspath(os.path.normpath(root))
+    return normalized_path == normalized_root or normalized_path.startswith(normalized_root + os.sep)
+
+
+def validate_strict_paths(cfg: Dict) -> None:
+    if not cfg.get("strict_paths_enabled"):
+        return
+
+    errors = []
+    for key in ("cache_dir", "state_dir"):
+        value = cfg.get(key)
+        if not isinstance(value, str) or not value or not path_is_under(value, "/data"):
+            errors.append(f"{key} must be under /data")
+
+    for key in ("status_file", "ipc_path", "runtime_dir"):
+        value = cfg.get(key)
+        if not isinstance(value, str) or not value or not path_is_under(value, "/tmp"):
+            errors.append(f"{key} must be under /tmp")
+
+    log_file = cfg.get("log_file")
+    if log_file and (not isinstance(log_file, str) or not path_is_under(log_file, "/data/logs")):
+        errors.append("log_file must be empty or under /data/logs")
+
+    if errors:
+        raise ValueError("strict_paths_enabled path validation failed: " + "; ".join(errors))
 
 
 def setup_logging(cfg: Dict) -> None:
@@ -988,6 +1019,10 @@ def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[Cache
                     if max_download_bytes and expected_size > max_download_bytes:
                         raise IOError(f"Download exceeds max_download_bytes ({expected_size}/{max_download_bytes})")
                     ensure_download_space(cfg["cache_dir"], expected_size, min_free_space_bytes)
+                else:
+                    if not max_download_bytes:
+                        raise IOError("Download without Content-Length requires max_download_bytes > 0")
+                    ensure_download_space(cfg["cache_dir"], max_download_bytes, min_free_space_bytes)
                 bytes_written = 0
                 with open(tmp_path, "wb") as fh:
                     for chunk in resp.iter_content(chunk_size=1024 * 256):
@@ -1063,6 +1098,18 @@ def ensure_hotkey_conf(cfg: Dict) -> Optional[str]:
         logging.warning("Failed to write hotkey conf: %s", exc)
         return None
     return conf_path
+
+
+def ensure_runtime_paths(cfg: Dict) -> None:
+    runtime_dir = cfg.get("runtime_dir") or default_runtime_dir()
+    if runtime_dir:
+        os.makedirs(runtime_dir, exist_ok=True)
+
+    ipc_path = cfg.get("ipc_path")
+    if isinstance(ipc_path, str) and ipc_path and not is_windows_named_pipe(ipc_path):
+        ipc_dir = os.path.dirname(ipc_path)
+        if ipc_dir:
+            os.makedirs(ipc_dir, exist_ok=True)
 
 
 def build_mpv_args(cfg: Dict) -> List[str]:
@@ -1191,6 +1238,11 @@ class MPVController:
 
         self._close_ipc()
         self._cleanup_ipc_path()
+        try:
+            ensure_runtime_paths(self._cfg)
+        except Exception as exc:
+            logging.error("Failed to prepare MPV runtime paths: %s", exc)
+            return False
         args = build_mpv_args(self._cfg)
         popen_kwargs = {
             "stdout": subprocess.DEVNULL,
