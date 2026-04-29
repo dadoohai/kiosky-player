@@ -94,6 +94,7 @@ DEFAULT_CONFIG = {
     "log_max_bytes": 5_000_000,
     "log_backup_count": 3,
     "watchdog_interval_sec": 10,
+    "mpv_watchdog_ping_failures_before_restart": 1,
     "media_load_retry_cooldown_sec": 60,
     "tmp_max_age_sec": 3600,
     "status_file": "",
@@ -940,6 +941,14 @@ def positive_float_config(cfg: Dict, key: str, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def watchdog_ping_failure_threshold(cfg: Dict) -> int:
+    try:
+        value = int(cfg.get("mpv_watchdog_ping_failures_before_restart", 1))
+    except (TypeError, ValueError):
+        return 1
+    return max(1, value)
 
 
 def media_alias(path: str, url: str = "") -> str:
@@ -1995,18 +2004,49 @@ def watchdog(
     status: StatusState,
     stop_event: threading.Event,
 ) -> None:
+    consecutive_ping_failures = 0
     while not stop_event.is_set():
         try:
             mpv.ensure_running()
+            cfg_snapshot = config_snapshot(cfg, cfg_lock)
+            timeout_sec = positive_float_config(cfg_snapshot, "mpv_ipc_timeout_sec", 2.0)
+            threshold = watchdog_ping_failure_threshold(cfg_snapshot)
             if not mpv.ping():
-                logging.warning(
-                    "MPV IPC unresponsive, restarting reason=ipc_unresponsive timeout_sec=%.2f generation=%d pid=%s log_file=%s",
-                    positive_float_config(config_snapshot(cfg, cfg_lock), "mpv_ipc_timeout_sec", 2.0),
-                    mpv.generation(),
-                    mpv.pid() or "none",
-                    mpv.current_log_file() or "none",
-                )
-                mpv.restart(reason="ipc_unresponsive")
+                consecutive_ping_failures += 1
+                if consecutive_ping_failures < threshold:
+                    logging.warning(
+                        "MPV IPC ping failed below restart threshold consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
+                        consecutive_ping_failures,
+                        threshold,
+                        timeout_sec,
+                        mpv.generation(),
+                        mpv.pid() or "none",
+                        mpv.current_log_file() or "none",
+                    )
+                else:
+                    logging.warning(
+                        "MPV IPC unresponsive, restarting reason=ipc_unresponsive consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
+                        consecutive_ping_failures,
+                        threshold,
+                        timeout_sec,
+                        mpv.generation(),
+                        mpv.pid() or "none",
+                        mpv.current_log_file() or "none",
+                    )
+                    mpv.restart(reason="ipc_unresponsive")
+                    consecutive_ping_failures = 0
+            else:
+                if consecutive_ping_failures:
+                    logging.info(
+                        "MPV IPC ping recovered consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
+                        consecutive_ping_failures,
+                        threshold,
+                        timeout_sec,
+                        mpv.generation(),
+                        mpv.pid() or "none",
+                        mpv.current_log_file() or "none",
+                    )
+                consecutive_ping_failures = 0
             status.update(mpv_running=mpv.is_running(), mpv_last_ok=iso_now())
         except Exception as exc:
             logging.warning("Watchdog error: %s", exc)

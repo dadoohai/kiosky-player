@@ -30,6 +30,7 @@ class ApplianceConfigTests(unittest.TestCase):
         self.assertEqual(cfg["mpv_msg_level"], "all=v")
         self.assertEqual(cfg["mpv_ipc_timeout_sec"], 2.0)
         self.assertEqual(cfg["mpv_startup_timeout_sec"], 10.0)
+        self.assertEqual(cfg["mpv_watchdog_ping_failures_before_restart"], 1)
         self.assertFalse(cfg["mpv_debug_events"])
 
     def test_appliance_paths_are_under_data_or_tmp(self) -> None:

@@ -78,6 +78,7 @@ Opcional no `config.json`:
 - `mpv_log_file`: arquivo de log bruto do MPV; no appliance use `/tmp/kiosky/mpv.log` para diagnostico temporario
 - `mpv_msg_level`: nivel de mensagens do MPV passado para `--msg-level`
 - `mpv_ipc_timeout_sec`: timeout de respostas IPC do MPV, padrao compativel `2.0`
+- `mpv_watchdog_ping_failures_before_restart`: falhas consecutivas de ping antes de reiniciar MPV; padrao `1`, use `2` somente como variante A/B de bancada
 - `mpv_startup_timeout_sec`: timeout para o socket IPC aparecer apos start do MPV, padrao compativel `10.0`
 - `mpv_debug_events`: logs internos extras de ping IPC, `loadfile` e restarts; deixe `false` fora de testes direcionados
 - `telemetry_enabled`: true/false
