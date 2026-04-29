@@ -1329,8 +1329,11 @@ class MPVController:
         while time.monotonic() - start < timeout:
             try:
                 if os.name == "nt" and ipc_path.startswith("\\\\.\\pipe\\"):
-                    self._ipc = open(ipc_path, "r+b", buffering=0)
-                    self._ipc_socket = False
+                    ipc = open(ipc_path, "r+b", buffering=0)
+                    with self._ipc_lock:
+                        self._close_ipc_locked()
+                        self._ipc = ipc
+                        self._ipc_socket = False
                     logging.info(
                         "MPV IPC startup wait complete transport=pipe generation=%d pid=%s duration_sec=%.2f timeout_sec=%.2f log_file=%s",
                         self._generation,
@@ -1344,8 +1347,10 @@ class MPVController:
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                     sock.settimeout(2.0)
                     sock.connect(ipc_path)
-                    self._ipc = sock
-                    self._ipc_socket = True
+                    with self._ipc_lock:
+                        self._close_ipc_locked()
+                        self._ipc = sock
+                        self._ipc_socket = True
                     logging.info(
                         "MPV IPC startup wait complete transport=socket generation=%d pid=%s duration_sec=%.2f timeout_sec=%.2f ipc_path=%s log_file=%s",
                         self._generation,
@@ -1371,7 +1376,7 @@ class MPVController:
         )
         return False
 
-    def _close_ipc(self) -> None:
+    def _close_ipc_locked(self) -> None:
         if self._ipc is None:
             return
         try:
@@ -1383,8 +1388,31 @@ class MPVController:
             self._ipc_socket = False
             self._recv_buffer = ""
 
-    def _stop_locked(self) -> None:
-        self._close_ipc()
+    def _close_ipc(self, reason: str = "cleanup", log_context: bool = False) -> None:
+        generation = self._generation
+        pid = self.pid() or "none"
+        log_file = self._current_log_file or "none"
+        if log_context:
+            logging.info(
+                "MPV IPC close waiting for IPC critical section reason=%s generation=%d pid=%s log_file=%s",
+                reason,
+                generation,
+                pid,
+                log_file,
+            )
+        with self._ipc_lock:
+            if log_context:
+                logging.info(
+                    "MPV IPC close entered IPC critical section reason=%s generation=%d pid=%s log_file=%s",
+                    reason,
+                    generation,
+                    pid,
+                    log_file,
+                )
+            self._close_ipc_locked()
+
+    def _stop_locked(self, reason: str = "stop") -> None:
+        self._close_ipc(reason=reason, log_context=True)
         if self._proc and self._proc.poll() is None:
             try:
                 if os.name != "nt" and self._proc.pid:
@@ -1407,9 +1435,9 @@ class MPVController:
         if self._proc and self._proc.poll() is None and self._ipc is not None:
             return True
         if self._proc and self._proc.poll() is None and self._ipc is None:
-            self._stop_locked()
+            self._stop_locked(reason="start_ipc_unavailable")
 
-        self._close_ipc()
+        self._close_ipc(reason="start_cleanup")
         self._cleanup_ipc_path()
         try:
             ensure_runtime_paths(self._cfg)
@@ -1451,7 +1479,7 @@ class MPVController:
             self._startup_timeout(),
             self._current_log_file or "none",
         )
-        self._stop_locked()
+        self._stop_locked(reason="start_ipc_timeout")
         return False
 
     def start(self) -> None:
@@ -1472,13 +1500,13 @@ class MPVController:
                 self.pid() or "none",
                 self._current_log_file or "none",
             )
-            self._stop_locked()
+            self._stop_locked(reason=reason)
             time.sleep(1)
             self._start_locked()
 
     def stop(self) -> None:
         with self._lock:
-            self._stop_locked()
+            self._stop_locked(reason="stop")
 
     def ensure_running(self) -> None:
         if self._proc is None or self._proc.poll() is not None:
@@ -1509,20 +1537,22 @@ class MPVController:
         command_label = command_name or str((payload.get("command") or ["unknown"])[0])
         start = time.monotonic()
         data = (json.dumps(payload) + "\n").encode("utf-8")
-        if self._ipc is None:
-            logging.warning(
-                "MPV IPC command skipped; IPC unavailable command=%s alias=%s generation=%d pid=%s log_file=%s",
-                command_label,
-                media_alias_value or "none",
-                self._generation,
-                self.pid() or "none",
-                self._current_log_file or "none",
-            )
-            return None if expect_response else False
         with self._ipc_lock:
+            if self._ipc is None:
+                logging.warning(
+                    "MPV IPC command skipped; IPC unavailable command=%s alias=%s generation=%d pid=%s log_file=%s",
+                    command_label,
+                    media_alias_value or "none",
+                    self._generation,
+                    self.pid() or "none",
+                    self._current_log_file or "none",
+                )
+                return None if expect_response else False
+            request_id = None
             if expect_response:
                 self._request_id += 1
-                payload["request_id"] = self._request_id
+                request_id = self._request_id
+                payload["request_id"] = request_id
                 data = (json.dumps(payload) + "\n").encode("utf-8")
             try:
                 if self._ipc_socket:
@@ -1554,7 +1584,7 @@ class MPVController:
                         self._current_log_file or "none",
                     )
                 return True
-            response = self._recv_response(self._request_id, timeout)
+            response = self._recv_response(request_id or 0, timeout)
             duration = time.monotonic() - start
             if response is None:
                 logging.warning(
