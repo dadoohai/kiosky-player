@@ -104,6 +104,23 @@ class DownloadSafetyTests(unittest.TestCase):
             self.assertFalse(dest.exists())
             self.assertFalse(Path(f"{dest}.tmp").exists())
 
+    def test_download_failure_log_uses_alias_without_full_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.example.invalid/private.mp4?token=secret"
+            response = FakeDownloadResponse(chunks=[b"partial"], iter_error=RuntimeError("stream stopped"))
+            fake_requests = FakeDownloadRequests(response)
+
+            with patch.object(kiosk, "requests", fake_requests):
+                with self.assertLogs(level="WARNING") as captured:
+                    items = kiosk.download_media(download_cfg(cache_dir), [raw_item(url)], None)
+
+            output = "\n".join(captured.output)
+            self.assertEqual(items, [])
+            self.assertIn("alias=media-", output)
+            self.assertNotIn(url, output)
+            self.assertNotIn("token=secret", output)
+
     def test_unknown_content_length_aborts_when_max_download_is_exceeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir)

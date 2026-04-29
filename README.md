@@ -16,16 +16,18 @@ Este projeto cria um player kiosk que busca midias em uma API, faz polling para 
 1. Copie o arquivo de exemplo e edite:
    - `cp config.example.json config.json`
 2. Preencha `api_key` e `environment_id` (ou rode em modo offline com cache local).
-3. (Opcional) ajuste `poll_interval_sec` (padrao 1800s), `mute`, `mpv_path`, `log_file`, `watchdog_interval_sec` e `preload_next`.
+3. (Opcional) ajuste `poll_interval_sec` (padrao 1800s), `mute`, `mpv_path`, `log_file`, `watchdog_interval_sec`, diagnostico MPV e `preload_next`.
 4. `ipc_path` vazio usa um padrao automatico (socket no Linux/macOS, named pipe no Windows).
 5. Para status/monitoramento, defina `status_file` (JSON) e `status_interval_sec`.
 6. Caminhos relativos (`cache_dir`, `state_dir`, `log_file`, `status_file`, `ipc_path`) sao resolvidos em relacao a pasta do `config.json`.
 
 ### Perfil appliance
 
-`config.appliance.example.json` e um exemplo conservador para Orange Pi em modo appliance. Ele usa cache e estado em `/data`, runtime/status/IPC em `/tmp`, desativa hotkeys, UI de configuracao, telemetria, sync NTP e preload, limita cache a 2 GiB/200 arquivos e reserva espaco livre antes de downloads. O perfil ativa `strict_paths_enabled`, que falha cedo se os caminhos mutaveis sairem de `/data` ou `/tmp`.
+`config.appliance.example.json` e um exemplo conservador para Orange Pi em modo appliance. Ele usa cache e estado em `/data`, runtime/status/IPC em `/tmp`, ativa log bruto do MPV em `/tmp/kiosky/mpv.log`, desativa hotkeys, UI de configuracao, telemetria, sync NTP e preload, limita cache a 2 GiB/200 arquivos e reserva espaco livre antes de downloads. O perfil ativa `strict_paths_enabled`, que falha cedo se os caminhos mutaveis sairem de `/data` ou `/tmp`.
 
 Copie esse arquivo para o caminho de configuracao provisionado pela integracao, por exemplo `/data/config/config.json`, e preencha somente placeholders seguros como `api_url`, `api_key`, `environment_id` e `station_id`. Nao coloque tokens reais no repositório; `telemetry_token` pode vir do config local ou da variavel `KIOSKY_TELEMETRY_TOKEN`.
+
+Para teste manual curto de bancada, mantenha `mpv_log_file=/tmp/kiosky/mpv.log` e ajuste `mpv_msg_level` conforme necessario. `mpv_debug_events=false` e o valor conservador; para correlacionar `loadfile`, ping IPC e restarts com mais detalhe, ative temporariamente `mpv_debug_events=true` na config privada da placa. Para producao futura, `mpv_log_file`, `mpv_msg_level` e `mpv_debug_events` podem ser reduzidos ou limpos.
 
 ## Rodar localmente
 
@@ -72,7 +74,12 @@ Opcional no `config.json`:
 - `cache_max_files` / `cache_max_bytes`: limites para limpeza por LRU (0 = desativado)
 - `min_free_space_bytes`: reserva minima de espaco livre antes de downloads
 - `max_download_bytes`: teto para downloads sem `Content-Length`; `0` recusa downloads sem tamanho declarado
-- `strict_paths_enabled`: valida perfil appliance (`cache_dir`/`state_dir` em `/data`, runtime/status/IPC em `/tmp`, `log_file` vazio ou em `/data/logs`)
+- `strict_paths_enabled`: valida perfil appliance (`cache_dir`/`state_dir` em `/data`, runtime/status/IPC em `/tmp`, `log_file` vazio ou em `/data/logs`, `mpv_log_file` vazio ou em `/tmp`/`/data/logs`)
+- `mpv_log_file`: arquivo de log bruto do MPV; no appliance use `/tmp/kiosky/mpv.log` para diagnostico temporario
+- `mpv_msg_level`: nivel de mensagens do MPV passado para `--msg-level`
+- `mpv_ipc_timeout_sec`: timeout de respostas IPC do MPV, padrao compativel `2.0`
+- `mpv_startup_timeout_sec`: timeout para o socket IPC aparecer apos start do MPV, padrao compativel `10.0`
+- `mpv_debug_events`: logs internos extras de ping IPC, `loadfile` e restarts; deixe `false` fora de testes direcionados
 - `telemetry_enabled`: true/false
 - `telemetry_interval_sec`: 300 (5 min)
 - `telemetry_url` e `station_id`

@@ -65,6 +65,11 @@ DEFAULT_CONFIG = {
     "min_free_space_bytes": 512 * 1024 * 1024,
     "max_download_bytes": 512 * 1024 * 1024,
     "mpv_path": "mpv",
+    "mpv_log_file": "",
+    "mpv_msg_level": "",
+    "mpv_ipc_timeout_sec": 2.0,
+    "mpv_startup_timeout_sec": 10.0,
+    "mpv_debug_events": False,
     "ipc_path": default_ipc_path(),
     "runtime_dir": default_runtime_dir(),
     "strict_paths_enabled": False,
@@ -161,7 +166,7 @@ def load_config(path: str) -> Dict:
     if not cfg.get("ipc_path"):
         cfg["ipc_path"] = default_ipc_path()
     config_dir = os.path.dirname(abs_path)
-    for key in ("cache_dir", "state_dir", "log_file", "status_file", "runtime_dir"):
+    for key in ("cache_dir", "state_dir", "log_file", "mpv_log_file", "status_file", "runtime_dir"):
         value = cfg.get(key)
         if isinstance(value, str) and value:
             cfg[key] = resolve_path_from_base(config_dir, value)
@@ -208,6 +213,13 @@ def validate_strict_paths(cfg: Dict) -> None:
     log_file = cfg.get("log_file")
     if log_file and (not isinstance(log_file, str) or not path_is_under(log_file, "/data/logs")):
         errors.append("log_file must be empty or under /data/logs")
+
+    mpv_log_file = cfg.get("mpv_log_file")
+    if mpv_log_file and (
+        not isinstance(mpv_log_file, str)
+        or not (path_is_under(mpv_log_file, "/tmp") or path_is_under(mpv_log_file, "/data/logs"))
+    ):
+        errors.append("mpv_log_file must be empty or under /tmp or /data/logs")
 
     if errors:
         raise ValueError("strict_paths_enabled path validation failed: " + "; ".join(errors))
@@ -919,6 +931,43 @@ def positive_int_config(cfg: Dict, key: str) -> int:
     return max(0, value)
 
 
+def positive_float_config(cfg: Dict, key: str, default: float) -> float:
+    raw_value = cfg.get(key)
+    if raw_value is None or raw_value == "":
+        return default
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def media_alias(path: str, url: str = "") -> str:
+    source = url or path or "unknown"
+    return f"media-{sha1_hex(source)[:10]}"
+
+
+def safe_media_path_for_log(path: str) -> str:
+    if not path:
+        return "<empty>"
+    if "://" in path:
+        return "<redacted-url>"
+    if path_is_under(path, "/tmp") or path_is_under(path, "/data"):
+        return path
+    return f"<local-path:{sha1_hex(path)[:10]}>"
+
+
+def media_load_log_context(item: MediaItem, index: int, duration_ms: int, mpv: "MPVController") -> str:
+    return (
+        f"alias={media_alias(item.path, item.url)} "
+        f"path={safe_media_path_for_log(item.path)} "
+        f"index={index} "
+        f"duration_ms={duration_ms} "
+        f"mpv_generation={mpv.generation()} "
+        f"mpv_pid={mpv.pid() or 'none'}"
+    )
+
+
 def free_space_bytes(path: str) -> int:
     stat = os.statvfs(path)
     return int(stat.f_bavail) * int(stat.f_frsize)
@@ -1005,10 +1054,12 @@ def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[Cache
     for item in raw_items:
         url = item["url"]
         dest = cache_path(cfg["cache_dir"], url)
+        alias = media_alias(dest, url)
+        safe_dest = safe_media_path_for_log(dest)
         if not os.path.exists(dest):
             tmp_path = f"{dest}.tmp"
             try:
-                logging.info("Downloading %s", url)
+                logging.info("Downloading media alias=%s path=%s", alias, safe_dest)
                 resp = requests.get(url, stream=True, timeout=cfg["request_timeout_sec"])
                 resp.raise_for_status()
                 expected_size = None
@@ -1039,14 +1090,14 @@ def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[Cache
                     raise IOError(f"Download size mismatch ({bytes_written}/{expected_size} bytes)")
                 os.replace(tmp_path, dest)
             except Exception as exc:
-                logging.warning("Failed to download %s: %s", url, exc)
+                logging.warning("Failed to download media alias=%s path=%s error=%s", alias, safe_dest, exc)
                 try:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
                 except Exception as cleanup_exc:
-                    logging.warning("Failed to cleanup temp file for %s: %s", url, cleanup_exc)
+                    logging.warning("Failed to cleanup temp file for media alias=%s path=%s error=%s", alias, safe_dest, cleanup_exc)
                 if os.path.exists(dest):
-                    logging.info("Using cached file for %s", url)
+                    logging.info("Using cached file for media alias=%s path=%s", alias, safe_dest)
                 else:
                     continue
 
@@ -1111,6 +1162,12 @@ def ensure_runtime_paths(cfg: Dict) -> None:
         if ipc_dir:
             os.makedirs(ipc_dir, exist_ok=True)
 
+    mpv_log_file = cfg.get("mpv_log_file")
+    if isinstance(mpv_log_file, str) and mpv_log_file:
+        mpv_log_dir = os.path.dirname(mpv_log_file)
+        if mpv_log_dir:
+            os.makedirs(mpv_log_dir, exist_ok=True)
+
 
 def build_mpv_args(cfg: Dict) -> List[str]:
     args = [
@@ -1126,6 +1183,12 @@ def build_mpv_args(cfg: Dict) -> List[str]:
         "--osd-level=0",
         f"--input-ipc-server={cfg['ipc_path']}",
     ]
+    mpv_log_file = cfg.get("mpv_log_file")
+    if mpv_log_file:
+        args.append(f"--log-file={mpv_log_file}")
+    mpv_msg_level = cfg.get("mpv_msg_level")
+    if mpv_msg_level:
+        args.append(f"--msg-level={mpv_msg_level}")
     args.append("--no-input-default-bindings")
     if cfg.get("low_resource_mode"):
         args += [
@@ -1166,6 +1229,21 @@ class MPVController:
         self._request_id = 0
         self._recv_buffer = ""
         self._generation = 0
+        self._restart_count = 0
+
+    def _ipc_timeout(self) -> float:
+        return positive_float_config(self._cfg, "mpv_ipc_timeout_sec", 2.0)
+
+    def _startup_timeout(self) -> float:
+        return positive_float_config(self._cfg, "mpv_startup_timeout_sec", 10.0)
+
+    def _debug_events(self) -> bool:
+        return bool(self._cfg.get("mpv_debug_events"))
+
+    def pid(self) -> Optional[int]:
+        if self._proc is None:
+            return None
+        return self._proc.pid
 
     def _cleanup_ipc_path(self) -> None:
         ipc_path = self._cfg["ipc_path"]
@@ -1180,12 +1258,20 @@ class MPVController:
     def _open_ipc(self) -> bool:
         ipc_path = self._cfg["ipc_path"]
         start = time.time()
-        timeout = 10
+        timeout = self._startup_timeout()
+        last_error = None
         while time.time() - start < timeout:
             try:
                 if os.name == "nt" and ipc_path.startswith("\\\\.\\pipe\\"):
                     self._ipc = open(ipc_path, "r+b", buffering=0)
                     self._ipc_socket = False
+                    logging.info(
+                        "MPV IPC pipe available generation=%d pid=%s after=%.2fs timeout_sec=%.2f",
+                        self._generation,
+                        self.pid() or "none",
+                        time.time() - start,
+                        timeout,
+                    )
                     return True
                 if os.path.exists(ipc_path):
                     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1193,9 +1279,26 @@ class MPVController:
                     sock.connect(ipc_path)
                     self._ipc = sock
                     self._ipc_socket = True
+                    logging.info(
+                        "MPV IPC socket available generation=%d pid=%s after=%.2fs timeout_sec=%.2f ipc_path=%s",
+                        self._generation,
+                        self.pid() or "none",
+                        time.time() - start,
+                        timeout,
+                        ipc_path,
+                    )
                     return True
-            except Exception:
+            except Exception as exc:
+                last_error = exc
                 time.sleep(0.2)
+        logging.warning(
+            "MPV IPC startup timeout generation=%d pid=%s timeout_sec=%.2f ipc_path=%s last_error=%s",
+            self._generation,
+            self.pid() or "none",
+            timeout,
+            ipc_path,
+            last_error or "none",
+        )
         return False
 
     def _close_ipc(self) -> None:
@@ -1259,9 +1362,15 @@ class MPVController:
             logging.error("Failed to start MPV process: %s", exc)
             return False
         self._generation += 1
+        logging.info("MPV process started pid=%s generation=%d", self.pid() or "none", self._generation)
         if self._open_ipc():
             return True
-        logging.warning("MPV IPC not available after launch; will retry.")
+        logging.warning(
+            "MPV IPC not available after launch; will retry. generation=%d pid=%s timeout_sec=%.2f",
+            self._generation,
+            self.pid() or "none",
+            self._startup_timeout(),
+        )
         self._stop_locked()
         return False
 
@@ -1272,8 +1381,16 @@ class MPVController:
             time.sleep(1)
             self._start_locked()
 
-    def restart(self) -> None:
+    def restart(self, reason: str = "manual") -> None:
         with self._lock:
+            self._restart_count += 1
+            logging.warning(
+                "Restarting MPV reason=%s restart_count=%d generation=%d pid=%s",
+                reason,
+                self._restart_count,
+                self._generation,
+                self.pid() or "none",
+            )
             self._stop_locked()
             time.sleep(1)
             self._start_locked()
@@ -1284,6 +1401,7 @@ class MPVController:
 
     def ensure_running(self) -> None:
         if self._proc is None or self._proc.poll() is not None:
+            logging.warning("MPV process not running; starting generation=%d pid=%s", self._generation, self.pid() or "none")
             self.start()
 
     def is_running(self) -> bool:
@@ -1292,9 +1410,26 @@ class MPVController:
     def generation(self) -> int:
         return self._generation
 
-    def _send(self, payload: Dict, expect_response: bool = False, timeout: float = 2.0) -> Optional[Dict]:
+    def _send(
+        self,
+        payload: Dict,
+        expect_response: bool = False,
+        timeout: Optional[float] = None,
+        command_name: str = "",
+        media_alias_value: str = "",
+    ) -> Optional[Dict]:
+        if timeout is None:
+            timeout = self._ipc_timeout()
+        command_label = command_name or str((payload.get("command") or ["unknown"])[0])
         data = (json.dumps(payload) + "\n").encode("utf-8")
         if self._ipc is None:
+            logging.warning(
+                "MPV IPC command skipped; IPC unavailable command=%s alias=%s generation=%d pid=%s",
+                command_label,
+                media_alias_value or "none",
+                self._generation,
+                self.pid() or "none",
+            )
             return None if expect_response else False
         with self._ipc_lock:
             if expect_response:
@@ -1307,11 +1442,38 @@ class MPVController:
                 else:
                     self._ipc.write(data)
                     self._ipc.flush()
-            except Exception:
+            except Exception as exc:
+                logging.warning(
+                    "MPV IPC command send failed command=%s alias=%s generation=%d pid=%s error=%s",
+                    command_label,
+                    media_alias_value or "none",
+                    self._generation,
+                    self.pid() or "none",
+                    exc,
+                )
                 return None if expect_response else False
             if not expect_response:
                 return True
-            return self._recv_response(self._request_id, timeout)
+            response = self._recv_response(self._request_id, timeout)
+            if response is None:
+                logging.warning(
+                    "MPV IPC command timeout command=%s alias=%s generation=%d pid=%s timeout_sec=%.2f",
+                    command_label,
+                    media_alias_value or "none",
+                    self._generation,
+                    self.pid() or "none",
+                    timeout,
+                )
+            elif response.get("error") != "success":
+                logging.warning(
+                    "MPV IPC command returned error command=%s alias=%s generation=%d pid=%s error=%s",
+                    command_label,
+                    media_alias_value or "none",
+                    self._generation,
+                    self.pid() or "none",
+                    response.get("error"),
+                )
+            return response
 
     def _recv_response(self, request_id: int, timeout: float) -> Optional[Dict]:
         if not self._ipc_socket or self._ipc is None:
@@ -1342,8 +1504,43 @@ class MPVController:
         self._recv_buffer = buffer
         return None
 
-    def load_file(self, path: str) -> bool:
-        return bool(self._send({"command": ["loadfile", path, "replace"]}))
+    def load_file(self, path: str, alias: str = "") -> bool:
+        alias_value = alias or media_alias(path)
+        safe_path = safe_media_path_for_log(path)
+        if self._debug_events():
+            logging.info(
+                "MPV loadfile sent alias=%s path=%s generation=%d pid=%s timeout_sec=%.2f",
+                alias_value,
+                safe_path,
+                self._generation,
+                self.pid() or "none",
+                self._ipc_timeout(),
+            )
+            response = self._send(
+                {"command": ["loadfile", path, "replace"]},
+                expect_response=True,
+                timeout=self._ipc_timeout(),
+                command_name="loadfile",
+                media_alias_value=alias_value,
+            )
+            ok = isinstance(response, dict) and response.get("error") == "success"
+        else:
+            ok = bool(
+                self._send(
+                    {"command": ["loadfile", path, "replace"]},
+                    command_name="loadfile",
+                    media_alias_value=alias_value,
+                )
+            )
+        if not ok:
+            logging.warning(
+                "MPV loadfile returned error alias=%s path=%s generation=%d pid=%s",
+                alias_value,
+                safe_path,
+                self._generation,
+                self.pid() or "none",
+            )
+        return ok
 
     def append_file(self, path: str) -> bool:
         return bool(self._send({"command": ["loadfile", path, "append"]}))
@@ -1362,9 +1559,32 @@ class MPVController:
 
     def ping(self) -> bool:
         if not self._ipc_socket:
-            return bool(self._send({"command": ["get_property", "idle-active"]}))
-        payload = self._send({"command": ["get_property", "idle-active"]}, expect_response=True, timeout=2.0)
-        return isinstance(payload, dict) and payload.get("error") == "success"
+            ok = bool(self._send({"command": ["get_property", "idle-active"]}, command_name="ping"))
+            if not ok:
+                logging.warning(
+                    "MPV IPC ping failed generation=%d pid=%s timeout_sec=%.2f",
+                    self._generation,
+                    self.pid() or "none",
+                    self._ipc_timeout(),
+                )
+            return ok
+        payload = self._send(
+            {"command": ["get_property", "idle-active"]},
+            expect_response=True,
+            timeout=self._ipc_timeout(),
+            command_name="ping",
+        )
+        ok = isinstance(payload, dict) and payload.get("error") == "success"
+        if not ok:
+            logging.warning(
+                "MPV IPC ping failed generation=%d pid=%s timeout_sec=%.2f",
+                self._generation,
+                self.pid() or "none",
+                self._ipc_timeout(),
+            )
+        elif self._debug_events():
+            logging.info("MPV IPC ping ok generation=%d pid=%s", self._generation, self.pid() or "none")
+        return ok
 
     def get_property(self, name: str, timeout: float = 2.0) -> Optional[object]:
         payload = self._send({"command": ["get_property", name]}, expect_response=True, timeout=timeout)
@@ -1636,8 +1856,13 @@ def watchdog(
         try:
             mpv.ensure_running()
             if not mpv.ping():
-                logging.warning("MPV IPC unresponsive, restarting")
-                mpv.restart()
+                logging.warning(
+                    "MPV IPC unresponsive, restarting reason=ipc_unresponsive timeout_sec=%.2f generation=%d pid=%s",
+                    positive_float_config(config_snapshot(cfg, cfg_lock), "mpv_ipc_timeout_sec", 2.0),
+                    mpv.generation(),
+                    mpv.pid() or "none",
+                )
+                mpv.restart(reason="ipc_unresponsive")
             status.update(mpv_running=mpv.is_running(), mpv_last_ok=iso_now())
         except Exception as exc:
             logging.warning("Watchdog error: %s", exc)
@@ -2047,12 +2272,20 @@ def playback_loop(
             preloaded_path = None
         reuse_preloaded = preloaded_path == item.path and offset_ms <= 0
         if not reuse_preloaded:
-            if not mpv.load_file(item.path):
-                logging.warning("Failed to load media, restarting MPV")
-                mpv.restart()
-                if not mpv.load_file(item.path):
+            item_alias = media_alias(item.path, item.url)
+            load_context = media_load_log_context(item, idx % len(items), item_duration_ms, mpv)
+            if not mpv.load_file(item.path, alias=item_alias):
+                logging.warning("Failed to load media, restarting MPV: %s", load_context)
+                mpv.restart(reason=f"media_load_failed:{item_alias}")
+                load_context = media_load_log_context(item, idx % len(items), item_duration_ms, mpv)
+                if not mpv.load_file(item.path, alias=item_alias):
                     cooldown_sec = max(int(cfg_snapshot.get("media_load_retry_cooldown_sec") or 0), 5)
                     blocked_media_until[item.path] = time.time() + cooldown_sec
+                    logging.warning(
+                        "Media load retry failed, entering cooldown: %s cooldown_sec=%d",
+                        load_context,
+                        cooldown_sec,
+                    )
                     status.update(
                         playback_state="recovering",
                         black_screen_risk_reason="media_load_failed",
@@ -2103,7 +2336,16 @@ def playback_loop(
         )
         cache_index.touch(item)
 
-        logging.info("Playing %s (duration=%s ms, offset=%s ms)", item.url, item_duration_ms, offset_ms)
+        logging.info(
+            "Playing media alias=%s path=%s index=%d duration_ms=%s offset_ms=%s mpv_generation=%d mpv_pid=%s",
+            media_alias(item.path, item.url),
+            safe_media_path_for_log(item.path),
+            idx % len(items),
+            item_duration_ms,
+            offset_ms,
+            mpv.generation(),
+            mpv.pid() or "none",
+        )
         item_started_mono = time.monotonic()
         remaining_ms = max(item_duration_ms - offset_ms, 1)
         current_cycle_start_ms = cycle_start_ms[idx]
