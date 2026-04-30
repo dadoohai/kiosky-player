@@ -95,6 +95,8 @@ DEFAULT_CONFIG = {
     "log_backup_count": 3,
     "watchdog_interval_sec": 10,
     "mpv_watchdog_ping_failures_before_restart": 1,
+    "mpv_watchdog_grace_after_load_sec": 0,
+    "mpv_watchdog_grace_after_restart_sec": 0,
     "media_load_retry_cooldown_sec": 60,
     "tmp_max_age_sec": 3600,
     "status_file": "",
@@ -951,6 +953,10 @@ def watchdog_ping_failure_threshold(cfg: Dict) -> int:
     return max(1, value)
 
 
+def watchdog_grace_seconds(cfg: Dict, key: str) -> float:
+    return positive_float_config(cfg, key, 0.0)
+
+
 def media_alias(path: str, url: str = "") -> str:
     source = url or path or "unknown"
     return f"media-{sha1_hex(source)[:10]}"
@@ -1282,6 +1288,8 @@ class MPVController:
         self._generation = 0
         self._restart_count = 0
         self._current_log_file = ""
+        self._last_start_monotonic: Optional[float] = None
+        self._last_loadfile_monotonic: Optional[float] = None
 
     def _ipc_timeout(self) -> float:
         return positive_float_config(self._cfg, "mpv_ipc_timeout_sec", 2.0)
@@ -1299,6 +1307,12 @@ class MPVController:
 
     def current_log_file(self) -> str:
         return self._current_log_file
+
+    def last_start_monotonic(self) -> Optional[float]:
+        return self._last_start_monotonic
+
+    def last_loadfile_monotonic(self) -> Optional[float]:
+        return self._last_loadfile_monotonic
 
     def _log_file_for_generation(self, generation: int) -> str:
         return mpv_log_file_for_generation(self._cfg.get("mpv_log_file"), generation)
@@ -1471,6 +1485,7 @@ class MPVController:
             self._current_log_file or "none",
         )
         if self._open_ipc():
+            self._last_start_monotonic = time.monotonic()
             return True
         logging.warning(
             "MPV IPC not available after launch; will retry. generation=%d pid=%s timeout_sec=%.2f log_file=%s",
@@ -1653,6 +1668,7 @@ class MPVController:
         alias_value = alias or media_alias(path)
         safe_path = safe_media_path_for_log(path)
         start = time.monotonic()
+        self._last_loadfile_monotonic = start
         if self._debug_events():
             logging.info(
                 "MPV loadfile sent alias=%s media_path=%s generation=%d pid=%s timeout_sec=%.2f log_file=%s",
@@ -1702,6 +1718,7 @@ class MPVController:
         return ok
 
     def append_file(self, path: str) -> bool:
+        self._last_loadfile_monotonic = time.monotonic()
         return bool(self._send({"command": ["loadfile", path, "append"]}))
 
     def playlist_next(self) -> bool:
@@ -2027,6 +2044,47 @@ def poller(
             wait_poll_interval(cfg_snapshot)
 
 
+def mpv_monotonic_timestamp(mpv: MPVController, method_name: str) -> Optional[float]:
+    method = getattr(mpv, method_name, None)
+    if not callable(method):
+        return None
+    try:
+        value = method()
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def watchdog_grace_state(
+    cfg: Dict,
+    mpv: MPVController,
+    now_monotonic: float,
+) -> Optional[Tuple[str, float, float]]:
+    candidates: List[Tuple[str, float, float]] = []
+    load_grace_sec = watchdog_grace_seconds(cfg, "mpv_watchdog_grace_after_load_sec")
+    load_ts = mpv_monotonic_timestamp(mpv, "last_loadfile_monotonic")
+    if load_grace_sec > 0 and load_ts is not None:
+        elapsed_sec = max(now_monotonic - load_ts, 0.0)
+        if elapsed_sec < load_grace_sec:
+            candidates.append(("within_grace_after_load", elapsed_sec, load_grace_sec))
+
+    restart_grace_sec = watchdog_grace_seconds(cfg, "mpv_watchdog_grace_after_restart_sec")
+    start_ts = mpv_monotonic_timestamp(mpv, "last_start_monotonic")
+    if restart_grace_sec > 0 and start_ts is not None:
+        elapsed_sec = max(now_monotonic - start_ts, 0.0)
+        if elapsed_sec < restart_grace_sec:
+            candidates.append(("within_grace_after_restart", elapsed_sec, restart_grace_sec))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[1])
+
+
 def watchdog(
     cfg: Dict,
     cfg_lock: threading.Lock,
@@ -2036,15 +2094,38 @@ def watchdog(
 ) -> None:
     consecutive_ping_failures = 0
     ping_failure_generation: Optional[int] = None
+    active_grace_reason: Optional[str] = None
+    active_grace_sec = 0.0
+    grace_suppressed_ping_failures = 0
     while not stop_event.is_set():
         try:
             mpv.ensure_running()
             cfg_snapshot = config_snapshot(cfg, cfg_lock)
             timeout_sec = positive_float_config(cfg_snapshot, "mpv_ipc_timeout_sec", 2.0)
             threshold = watchdog_ping_failure_threshold(cfg_snapshot)
+            now_monotonic = time.monotonic()
+            grace_state = watchdog_grace_state(cfg_snapshot, mpv, now_monotonic)
             current_generation = mpv.generation()
             current_pid = mpv.pid() or "none"
             current_log_file = mpv.current_log_file() or "none"
+            if grace_state is None and active_grace_reason is not None:
+                logging.info(
+                    "MPV watchdog grace window expired; resuming normal ping policy reason=%s suppressed_ping_failures=%d threshold=%d timeout_sec=%.2f grace_sec=%.2f generation=%d pid=%s log_file=%s",
+                    active_grace_reason,
+                    grace_suppressed_ping_failures,
+                    threshold,
+                    timeout_sec,
+                    active_grace_sec,
+                    current_generation,
+                    current_pid,
+                    current_log_file,
+                )
+                active_grace_reason = None
+                active_grace_sec = 0.0
+                grace_suppressed_ping_failures = 0
+            elif grace_state is not None:
+                active_grace_reason = grace_state[0]
+                active_grace_sec = grace_state[2]
             if (
                 consecutive_ping_failures
                 and ping_failure_generation is not None
@@ -2063,31 +2144,60 @@ def watchdog(
                 consecutive_ping_failures = 0
                 ping_failure_generation = None
             if not mpv.ping():
-                ping_failure_generation = current_generation
-                consecutive_ping_failures += 1
-                if consecutive_ping_failures < threshold:
+                if grace_state is not None:
+                    reason, elapsed_sec, grace_sec = grace_state
+                    grace_suppressed_ping_failures += 1
+                    if consecutive_ping_failures:
+                        logging.info(
+                            "MPV IPC ping failure counter reset during watchdog grace consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f reason=%s generation=%d pid=%s log_file=%s",
+                            consecutive_ping_failures,
+                            threshold,
+                            timeout_sec,
+                            reason,
+                            current_generation,
+                            current_pid,
+                            current_log_file,
+                        )
+                    consecutive_ping_failures = 0
+                    ping_failure_generation = None
                     logging.warning(
-                        "MPV IPC ping failed below restart threshold consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
-                        consecutive_ping_failures,
+                        "MPV IPC ping failed within watchdog grace; restart suppressed reason=%s suppressed_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s elapsed_sec=%.2f grace_sec=%.2f log_file=%s",
+                        reason,
+                        grace_suppressed_ping_failures,
                         threshold,
                         timeout_sec,
                         current_generation,
                         current_pid,
+                        elapsed_sec,
+                        grace_sec,
                         current_log_file,
                     )
                 else:
-                    logging.warning(
-                        "MPV IPC unresponsive, restarting reason=ipc_unresponsive consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
-                        consecutive_ping_failures,
-                        threshold,
-                        timeout_sec,
-                        current_generation,
-                        current_pid,
-                        current_log_file,
-                    )
-                    mpv.restart(reason="ipc_unresponsive")
-                    consecutive_ping_failures = 0
-                    ping_failure_generation = None
+                    ping_failure_generation = current_generation
+                    consecutive_ping_failures += 1
+                    if consecutive_ping_failures < threshold:
+                        logging.warning(
+                            "MPV IPC ping failed below restart threshold consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
+                            consecutive_ping_failures,
+                            threshold,
+                            timeout_sec,
+                            current_generation,
+                            current_pid,
+                            current_log_file,
+                        )
+                    else:
+                        logging.warning(
+                            "MPV IPC unresponsive, restarting reason=ipc_unresponsive consecutive_ping_failures=%d threshold=%d timeout_sec=%.2f generation=%d pid=%s log_file=%s",
+                            consecutive_ping_failures,
+                            threshold,
+                            timeout_sec,
+                            current_generation,
+                            current_pid,
+                            current_log_file,
+                        )
+                        mpv.restart(reason="ipc_unresponsive")
+                        consecutive_ping_failures = 0
+                        ping_failure_generation = None
             else:
                 if consecutive_ping_failures:
                     logging.info(

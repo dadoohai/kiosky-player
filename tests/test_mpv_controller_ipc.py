@@ -55,6 +55,14 @@ class BlockingIPC:
 class ImmediateIPC:
     def __init__(self) -> None:
         self.closed = False
+        self.write_calls = 0
+
+    def write(self, data: bytes) -> int:
+        self.write_calls += 1
+        return len(data)
+
+    def flush(self) -> None:
+        return None
 
     def close(self) -> None:
         self.closed = True
@@ -204,6 +212,27 @@ class MPVControllerIPCLockTests(unittest.TestCase):
         self.assertIsNone(controller._ipc)
         self.assertIsNone(controller._proc)
         start.assert_called_once_with()
+
+    def test_start_records_last_start_timestamp_after_ipc_ready(self) -> None:
+        controller = kiosk.MPVController(controller_config())
+        proc = FakeProcess()
+
+        with mock.patch("kiosk.subprocess.Popen", return_value=proc):
+            with mock.patch.object(controller, "_open_ipc", return_value=True):
+                with mock.patch("kiosk.time.monotonic", return_value=321.5):
+                    controller.start()
+
+        self.assertEqual(controller.last_start_monotonic(), 321.5)
+
+    def test_load_file_records_last_loadfile_attempt_timestamp(self) -> None:
+        ipc = ImmediateIPC()
+        controller = self.build_controller(ipc)
+
+        with mock.patch("kiosk.time.monotonic", side_effect=[654.25, 654.30]):
+            self.assertTrue(controller.load_file("/tmp/media.mp4", alias="media-test"))
+
+        self.assertEqual(controller.last_loadfile_monotonic(), 654.25)
+        self.assertEqual(ipc.write_calls, 1)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,26 @@
 import threading
 import unittest
+from unittest import mock
 
 import kiosk
 
 
 class FakeMPV:
-    def __init__(self, ping_results, stop_event, generations=None):
+    def __init__(
+        self,
+        ping_results,
+        stop_event,
+        generations=None,
+        last_load_at=None,
+        last_start_at=None,
+    ):
         self.ping_results = list(ping_results)
         self.generations = list(generations or [7])
         self.stop_event = stop_event
         self.restart_reasons = []
         self.ping_calls = 0
+        self.last_load_at = last_load_at
+        self.last_start_at = last_start_at
 
     def ensure_running(self) -> None:
         return None
@@ -41,11 +51,31 @@ class FakeMPV:
     def current_log_file(self) -> str:
         return f"/tmp/kiosky/mpv-g{self.generation():03d}.log"
 
+    def last_loadfile_monotonic(self):
+        return self.last_load_at
+
+    def last_start_monotonic(self):
+        return self.last_start_at
+
 
 class WatchdogTests(unittest.TestCase):
-    def run_watchdog_once(self, ping_results, cfg=None, generations=None):
+    def run_watchdog_once(
+        self,
+        ping_results,
+        cfg=None,
+        generations=None,
+        last_load_at=None,
+        last_start_at=None,
+        monotonic_values=None,
+    ):
         stop_event = threading.Event()
-        mpv = FakeMPV(ping_results, stop_event, generations=generations)
+        mpv = FakeMPV(
+            ping_results,
+            stop_event,
+            generations=generations,
+            last_load_at=last_load_at,
+            last_start_at=last_start_at,
+        )
         watchdog_cfg = {
             "watchdog_interval_sec": 0,
             "mpv_ipc_timeout_sec": 2.0,
@@ -54,12 +84,18 @@ class WatchdogTests(unittest.TestCase):
             watchdog_cfg.update(cfg)
         status = kiosk.StatusState()
 
-        kiosk.watchdog(watchdog_cfg, threading.Lock(), mpv, status, stop_event)
+        if monotonic_values is None:
+            kiosk.watchdog(watchdog_cfg, threading.Lock(), mpv, status, stop_event)
+        else:
+            with mock.patch("kiosk.time.monotonic", side_effect=monotonic_values):
+                kiosk.watchdog(watchdog_cfg, threading.Lock(), mpv, status, stop_event)
 
         return mpv, status
 
     def test_default_threshold_is_one_and_restarts_on_first_failure(self) -> None:
         self.assertEqual(kiosk.DEFAULT_CONFIG["mpv_watchdog_ping_failures_before_restart"], 1)
+        self.assertEqual(kiosk.DEFAULT_CONFIG["mpv_watchdog_grace_after_load_sec"], 0)
+        self.assertEqual(kiosk.DEFAULT_CONFIG["mpv_watchdog_grace_after_restart_sec"], 0)
 
         mpv, _status = self.run_watchdog_once([False])
 
@@ -93,6 +129,66 @@ class WatchdogTests(unittest.TestCase):
         mpv, _status = self.run_watchdog_once(
             [False, True, False],
             {"mpv_watchdog_ping_failures_before_restart": 2},
+        )
+
+        self.assertEqual(mpv.restart_reasons, [])
+
+    def test_grace_after_load_suppresses_restart_during_window(self) -> None:
+        with self.assertLogs(level="WARNING") as logs:
+            mpv, _status = self.run_watchdog_once(
+                [False],
+                {
+                    "mpv_watchdog_ping_failures_before_restart": 1,
+                    "mpv_watchdog_grace_after_load_sec": 10,
+                },
+                last_load_at=95.0,
+                monotonic_values=[100.0],
+            )
+
+        self.assertEqual(mpv.restart_reasons, [])
+        self.assertIn("within_grace_after_load", "\n".join(logs.output))
+
+    def test_grace_after_restart_suppresses_restart_during_window(self) -> None:
+        with self.assertLogs(level="WARNING") as logs:
+            mpv, _status = self.run_watchdog_once(
+                [False],
+                {
+                    "mpv_watchdog_ping_failures_before_restart": 1,
+                    "mpv_watchdog_grace_after_restart_sec": 10,
+                },
+                last_start_at=195.0,
+                monotonic_values=[200.0],
+            )
+
+        self.assertEqual(mpv.restart_reasons, [])
+        self.assertIn("within_grace_after_restart", "\n".join(logs.output))
+
+    def test_threshold_resumes_after_grace_window_expires(self) -> None:
+        with self.assertLogs(level="INFO") as logs:
+            mpv, _status = self.run_watchdog_once(
+                [False, False, False],
+                {
+                    "mpv_watchdog_ping_failures_before_restart": 2,
+                    "mpv_watchdog_grace_after_load_sec": 5,
+                },
+                last_load_at=100.0,
+                monotonic_values=[101.0, 106.0, 107.0],
+            )
+
+        self.assertEqual(mpv.restart_reasons, ["ipc_unresponsive"])
+        log_text = "\n".join(logs.output)
+        self.assertIn("restart suppressed reason=within_grace_after_load", log_text)
+        self.assertIn("grace window expired", log_text)
+
+    def test_grace_suppressed_failure_does_not_count_toward_threshold(self) -> None:
+        mpv, _status = self.run_watchdog_once(
+            [False, False],
+            {
+                "mpv_watchdog_ping_failures_before_restart": 2,
+                "mpv_watchdog_grace_after_load_sec": 5,
+            },
+            last_load_at=100.0,
+            monotonic_values=[101.0, 106.0],
         )
 
         self.assertEqual(mpv.restart_reasons, [])

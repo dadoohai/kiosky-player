@@ -52,6 +52,8 @@
   "log_backup_count": 3,
   "watchdog_interval_sec": 10,
   "mpv_watchdog_ping_failures_before_restart": 1,
+  "mpv_watchdog_grace_after_load_sec": 0,
+  "mpv_watchdog_grace_after_restart_sec": 0,
   "media_load_retry_cooldown_sec": 60,
   "tmp_max_age_sec": 3600,
   "status_file": "/tmp/kiosky-status.json",
