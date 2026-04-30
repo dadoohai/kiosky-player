@@ -11,6 +11,10 @@ import kiosk
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def count_arg_prefix(args, prefix: str) -> int:
+    return sum(1 for arg in args if arg == prefix or arg.startswith(f"{prefix}="))
+
+
 class ApplianceConfigTests(unittest.TestCase):
     def test_appliance_example_is_parseable(self) -> None:
         cfg = json.loads((REPO_ROOT / "config.appliance.example.json").read_text(encoding="utf-8"))
@@ -35,6 +39,16 @@ class ApplianceConfigTests(unittest.TestCase):
         self.assertEqual(cfg["mpv_watchdog_grace_after_restart_sec"], 0)
         self.assertFalse(cfg["mpv_debug_events"])
         self.assertFalse(cfg["mpv_query_uses_fresh_ipc"])
+        self.assertEqual(cfg["mpv_vo"], "gpu")
+        self.assertEqual(cfg["mpv_gpu_context"], "drm")
+        self.assertEqual(cfg["mpv_ao"], "null")
+
+    def test_generic_example_keeps_mpv_output_automatic(self) -> None:
+        cfg = json.loads((REPO_ROOT / "config.example.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(cfg["mpv_vo"], "")
+        self.assertEqual(cfg["mpv_gpu_context"], "")
+        self.assertEqual(cfg["mpv_ao"], "")
 
     def test_appliance_paths_are_under_data_or_tmp(self) -> None:
         cfg = json.loads((REPO_ROOT / "config.appliance.example.json").read_text(encoding="utf-8"))
@@ -147,6 +161,99 @@ class ApplianceConfigTests(unittest.TestCase):
 
         self.assertIn("--log-file=/tmp/kiosky/mpv.log", args)
         self.assertIn("--msg-level=all=v", args)
+
+    def test_build_mpv_args_does_not_add_empty_output_flags(self) -> None:
+        cfg = {
+            "mpv_path": "mpv",
+            "ipc_path": "/tmp/kiosky/mpv.sock",
+            "mpv_log_file": "",
+            "mpv_msg_level": "",
+            "mpv_vo": "",
+            "mpv_gpu_context": "",
+            "mpv_ao": "",
+            "hotkeys_enabled": False,
+            "lock_input": True,
+            "hwdec": "",
+            "rotation_deg": 0,
+        }
+
+        args = kiosk.build_mpv_args(cfg)
+
+        self.assertEqual(count_arg_prefix(args, "--vo"), 0)
+        self.assertEqual(count_arg_prefix(args, "--gpu-context"), 0)
+        self.assertEqual(count_arg_prefix(args, "--ao"), 0)
+
+    def test_build_mpv_args_adds_explicit_vo(self) -> None:
+        cfg = {
+            "mpv_path": "mpv",
+            "ipc_path": "/tmp/kiosky/mpv.sock",
+            "mpv_log_file": "",
+            "mpv_msg_level": "",
+            "mpv_vo": "gpu",
+            "hotkeys_enabled": False,
+            "lock_input": True,
+            "hwdec": "",
+            "rotation_deg": 0,
+        }
+
+        args = kiosk.build_mpv_args(cfg)
+
+        self.assertIn("--vo=gpu", args)
+
+    def test_build_mpv_args_adds_explicit_gpu_context(self) -> None:
+        cfg = {
+            "mpv_path": "mpv",
+            "ipc_path": "/tmp/kiosky/mpv.sock",
+            "mpv_log_file": "",
+            "mpv_msg_level": "",
+            "mpv_gpu_context": "drm",
+            "hotkeys_enabled": False,
+            "lock_input": True,
+            "hwdec": "",
+            "rotation_deg": 0,
+        }
+
+        args = kiosk.build_mpv_args(cfg)
+
+        self.assertIn("--gpu-context=drm", args)
+
+    def test_build_mpv_args_adds_explicit_ao(self) -> None:
+        cfg = {
+            "mpv_path": "mpv",
+            "ipc_path": "/tmp/kiosky/mpv.sock",
+            "mpv_log_file": "",
+            "mpv_msg_level": "",
+            "mpv_ao": "null",
+            "hotkeys_enabled": False,
+            "lock_input": True,
+            "hwdec": "",
+            "rotation_deg": 0,
+        }
+
+        args = kiosk.build_mpv_args(cfg)
+
+        self.assertIn("--ao=null", args)
+
+    def test_build_mpv_args_does_not_duplicate_explicit_output_flags(self) -> None:
+        cfg = {
+            "mpv_path": "mpv",
+            "ipc_path": "/tmp/kiosky/mpv.sock",
+            "mpv_log_file": "",
+            "mpv_msg_level": "",
+            "mpv_vo": "gpu",
+            "mpv_gpu_context": "drm",
+            "mpv_ao": "null",
+            "hotkeys_enabled": False,
+            "lock_input": True,
+            "hwdec": "",
+            "rotation_deg": 0,
+        }
+
+        args = kiosk.build_mpv_args(cfg)
+
+        self.assertEqual(count_arg_prefix(args, "--vo"), 1)
+        self.assertEqual(count_arg_prefix(args, "--gpu-context"), 1)
+        self.assertEqual(count_arg_prefix(args, "--ao"), 1)
 
     def test_mpv_log_file_for_generation_inserts_generation_suffix(self) -> None:
         path = kiosk.mpv_log_file_for_generation("/tmp/kiosky/mpv.log", 7)

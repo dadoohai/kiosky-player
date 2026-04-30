@@ -71,6 +71,9 @@ DEFAULT_CONFIG = {
     "mpv_startup_timeout_sec": 10.0,
     "mpv_debug_events": False,
     "mpv_query_uses_fresh_ipc": False,
+    "mpv_vo": "",
+    "mpv_gpu_context": "",
+    "mpv_ao": "",
     "ipc_path": default_ipc_path(),
     "runtime_dir": default_runtime_dir(),
     "strict_paths_enabled": False,
@@ -1227,6 +1230,15 @@ def update_latest_mpv_log_alias(mpv_log_file: object, generation_log_file: str) 
         )
 
 
+def append_mpv_option_once(args: List[str], option_name: str, value: object) -> None:
+    if value is None or value == "":
+        return
+    option_prefix = f"--{option_name}"
+    if any(arg == option_prefix or arg.startswith(f"{option_prefix}=") for arg in args):
+        return
+    args.append(f"{option_prefix}={value}")
+
+
 def build_mpv_args(cfg: Dict, mpv_log_file: Optional[str] = None) -> List[str]:
     args = [
         cfg["mpv_path"],
@@ -1247,6 +1259,9 @@ def build_mpv_args(cfg: Dict, mpv_log_file: Optional[str] = None) -> List[str]:
     mpv_msg_level = cfg.get("mpv_msg_level")
     if mpv_msg_level:
         args.append(f"--msg-level={mpv_msg_level}")
+    append_mpv_option_once(args, "vo", cfg.get("mpv_vo"))
+    append_mpv_option_once(args, "gpu-context", cfg.get("mpv_gpu_context"))
+    append_mpv_option_once(args, "ao", cfg.get("mpv_ao"))
     args.append("--no-input-default-bindings")
     if cfg.get("low_resource_mode"):
         args += [
