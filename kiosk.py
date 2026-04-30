@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "mpv_ipc_timeout_sec": 2.0,
     "mpv_startup_timeout_sec": 10.0,
     "mpv_debug_events": False,
+    "mpv_query_uses_fresh_ipc": False,
     "ipc_path": default_ipc_path(),
     "runtime_dir": default_runtime_dir(),
     "strict_paths_enabled": False,
@@ -1283,6 +1284,7 @@ class MPVController:
         self._ipc_socket = False
         self._lock = threading.RLock()
         self._ipc_lock = threading.Lock()
+        self._request_id_lock = threading.Lock()
         self._request_id = 0
         self._recv_buffer = ""
         self._generation = 0
@@ -1299,6 +1301,9 @@ class MPVController:
 
     def _debug_events(self) -> bool:
         return bool(self._cfg.get("mpv_debug_events"))
+
+    def _query_uses_fresh_ipc(self) -> bool:
+        return bool(self._cfg.get("mpv_query_uses_fresh_ipc"))
 
     def pid(self) -> Optional[int]:
         if self._proc is None:
@@ -1539,6 +1544,11 @@ class MPVController:
     def generation(self) -> int:
         return self._generation
 
+    def _next_request_id(self) -> int:
+        with self._request_id_lock:
+            self._request_id += 1
+            return self._request_id
+
     def _send(
         self,
         payload: Dict,
@@ -1565,8 +1575,7 @@ class MPVController:
                 return None if expect_response else False
             request_id = None
             if expect_response:
-                self._request_id += 1
-                request_id = self._request_id
+                request_id = self._next_request_id()
                 payload["request_id"] = request_id
                 data = (json.dumps(payload) + "\n").encode("utf-8")
             try:
@@ -1635,25 +1644,50 @@ class MPVController:
                 )
             return response
 
-    def _recv_response(self, request_id: int, timeout: float) -> Optional[Dict]:
-        if not self._ipc_socket or self._ipc is None:
-            return None
+    def _recv_response_from_ipc(
+        self,
+        ipc,
+        ipc_socket: bool,
+        request_id: int,
+        timeout: float,
+        initial_buffer: str = "",
+        transport: str = "persistent",
+    ) -> Tuple[Optional[Dict], str]:
+        if not ipc_socket or ipc is None:
+            return None, initial_buffer
         deadline = time.time() + max(timeout, 0.1)
-        buffer = self._recv_buffer
+        buffer = initial_buffer
+        buffer_before_bytes = len(buffer.encode("utf-8", errors="ignore"))
+        lines_read = 0
+        events_without_request_id = 0
+        responses_other_request_id = 0
+        responses_expected_request_id = 0
+        invalid_json_lines = 0
         while time.time() < deadline:
             if "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
+                lines_read += 1
                 if line:
                     try:
                         payload = json.loads(line)
                     except Exception:
+                        invalid_json_lines += 1
                         payload = None
-                    if isinstance(payload, dict) and payload.get("request_id") == request_id:
-                        self._recv_buffer = buffer
-                        return payload
+                    if isinstance(payload, dict):
+                        payload_request_id = payload.get("request_id")
+                        if payload_request_id == request_id:
+                            responses_expected_request_id += 1
+                            return payload, buffer
+                        if payload_request_id is None:
+                            events_without_request_id += 1
+                        else:
+                            responses_other_request_id += 1
+                    elif payload is not None:
+                        events_without_request_id += 1
+                continue
             try:
-                self._ipc.settimeout(max(deadline - time.time(), 0.1))
-                chunk = self._ipc.recv(4096)
+                ipc.settimeout(max(deadline - time.time(), 0.1))
+                chunk = ipc.recv(4096)
                 if not chunk:
                     break
                 buffer += chunk.decode("utf-8", errors="ignore")
@@ -1661,8 +1695,143 @@ class MPVController:
                 continue
             except Exception:
                 break
+        logging.warning(
+            "MPV IPC response timeout request_id=%d transport=%s generation=%d pid=%s timeout_sec=%.2f lines_read=%d events_without_request_id=%d responses_other_request_id=%d responses_expected_request_id=%d invalid_json_lines=%d buffer_before_bytes=%d buffer_after_bytes=%d log_file=%s",
+            request_id,
+            transport,
+            self._generation,
+            self.pid() or "none",
+            timeout,
+            lines_read,
+            events_without_request_id,
+            responses_other_request_id,
+            responses_expected_request_id,
+            invalid_json_lines,
+            buffer_before_bytes,
+            len(buffer.encode("utf-8", errors="ignore")),
+            self._current_log_file or "none",
+        )
+        return None, buffer
+
+    def _recv_response(self, request_id: int, timeout: float) -> Optional[Dict]:
+        response, buffer = self._recv_response_from_ipc(
+            self._ipc,
+            self._ipc_socket,
+            request_id,
+            timeout,
+            initial_buffer=self._recv_buffer,
+            transport="persistent",
+        )
         self._recv_buffer = buffer
-        return None
+        return response
+
+    def _open_fresh_ipc(self, timeout: float):
+        ipc_path = self._cfg["ipc_path"]
+        if os.name == "nt" and ipc_path.startswith("\\\\.\\pipe\\"):
+            return open(ipc_path, "r+b", buffering=0), False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(ipc_path)
+        except Exception:
+            sock.close()
+            raise
+        return sock, True
+
+    def _fresh_ipc_query(
+        self,
+        command: List[object],
+        command_name: str,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict]:
+        if timeout is None:
+            timeout = self._ipc_timeout()
+        request_id = self._next_request_id()
+        payload = {"command": command, "request_id": request_id}
+        data = (json.dumps(payload) + "\n").encode("utf-8")
+        start = time.monotonic()
+        ipc = None
+        logging.info(
+            "MPV IPC fresh query begin command=%s request_id=%d generation=%d pid=%s timeout_sec=%.2f log_file=%s",
+            command_name,
+            request_id,
+            self._generation,
+            self.pid() or "none",
+            timeout,
+            self._current_log_file or "none",
+        )
+        try:
+            ipc, ipc_socket = self._open_fresh_ipc(timeout)
+            if ipc_socket:
+                ipc.sendall(data)
+            else:
+                ipc.write(data)
+                ipc.flush()
+            response, _buffer = self._recv_response_from_ipc(
+                ipc,
+                ipc_socket,
+                request_id,
+                timeout,
+                initial_buffer="",
+                transport="fresh",
+            )
+        except Exception as exc:
+            logging.warning(
+                "MPV IPC fresh query failed command=%s request_id=%d generation=%d pid=%s duration_sec=%.3f timeout_sec=%.2f log_file=%s error=%s",
+                command_name,
+                request_id,
+                self._generation,
+                self.pid() or "none",
+                time.monotonic() - start,
+                timeout,
+                self._current_log_file or "none",
+                exc,
+            )
+            return None
+        finally:
+            if ipc is not None:
+                try:
+                    ipc.close()
+                except Exception:
+                    pass
+        duration = time.monotonic() - start
+        if response is None:
+            logging.warning(
+                "MPV IPC fresh query timeout command=%s request_id=%d generation=%d pid=%s duration_sec=%.3f timeout_sec=%.2f log_file=%s",
+                command_name,
+                request_id,
+                self._generation,
+                self.pid() or "none",
+                duration,
+                timeout,
+                self._current_log_file or "none",
+            )
+        elif response.get("error") != "success":
+            logging.warning(
+                "MPV IPC fresh query returned error command=%s request_id=%d generation=%d pid=%s duration_sec=%.3f log_file=%s error=%s",
+                command_name,
+                request_id,
+                self._generation,
+                self.pid() or "none",
+                duration,
+                self._current_log_file or "none",
+                response.get("error"),
+            )
+        else:
+            logging.info(
+                "MPV IPC fresh query ok command=%s request_id=%d generation=%d pid=%s duration_sec=%.3f timeout_sec=%.2f log_file=%s",
+                command_name,
+                request_id,
+                self._generation,
+                self.pid() or "none",
+                duration,
+                timeout,
+                self._current_log_file or "none",
+            )
+        return response
+
+    def _fresh_ipc_get_property(self, name: str, timeout: Optional[float] = None) -> Optional[Dict]:
+        return self._fresh_ipc_query(["get_property", name], command_name="get_property", timeout=timeout)
 
     def load_file(self, path: str, alias: str = "") -> bool:
         alias_value = alias or media_alias(path)
@@ -1735,6 +1904,29 @@ class MPVController:
 
     def ping(self) -> bool:
         start = time.monotonic()
+        if self._query_uses_fresh_ipc():
+            payload = self._fresh_ipc_get_property("idle-active", timeout=self._ipc_timeout())
+            ok = isinstance(payload, dict) and payload.get("error") == "success"
+            duration = time.monotonic() - start
+            if not ok:
+                logging.warning(
+                    "MPV IPC ping failed generation=%d pid=%s duration_sec=%.3f timeout_sec=%.2f log_file=%s",
+                    self._generation,
+                    self.pid() or "none",
+                    duration,
+                    self._ipc_timeout(),
+                    self._current_log_file or "none",
+                )
+            elif self._debug_events():
+                logging.info(
+                    "MPV IPC ping ok generation=%d pid=%s duration_sec=%.3f timeout_sec=%.2f log_file=%s",
+                    self._generation,
+                    self.pid() or "none",
+                    duration,
+                    self._ipc_timeout(),
+                    self._current_log_file or "none",
+                )
+            return ok
         if not self._ipc_socket:
             ok = bool(self._send({"command": ["get_property", "idle-active"]}, command_name="ping"))
             duration = time.monotonic() - start
@@ -1786,7 +1978,10 @@ class MPVController:
         return ok
 
     def get_property(self, name: str, timeout: float = 2.0) -> Optional[object]:
-        payload = self._send({"command": ["get_property", name]}, expect_response=True, timeout=timeout)
+        if self._query_uses_fresh_ipc():
+            payload = self._fresh_ipc_get_property(name, timeout=timeout)
+        else:
+            payload = self._send({"command": ["get_property", name]}, expect_response=True, timeout=timeout)
         if isinstance(payload, dict) and payload.get("error") == "success":
             return payload.get("data")
         return None

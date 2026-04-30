@@ -34,6 +34,7 @@ class ApplianceConfigTests(unittest.TestCase):
         self.assertEqual(cfg["mpv_watchdog_grace_after_load_sec"], 0)
         self.assertEqual(cfg["mpv_watchdog_grace_after_restart_sec"], 0)
         self.assertFalse(cfg["mpv_debug_events"])
+        self.assertFalse(cfg["mpv_query_uses_fresh_ipc"])
 
     def test_appliance_paths_are_under_data_or_tmp(self) -> None:
         cfg = json.loads((REPO_ROOT / "config.appliance.example.json").read_text(encoding="utf-8"))

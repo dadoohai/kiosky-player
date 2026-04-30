@@ -68,6 +68,31 @@ class ImmediateIPC:
         self.closed = True
 
 
+class ChunkedSocket:
+    def __init__(self, chunks) -> None:
+        self.chunks = list(chunks)
+        self.timeout_values = []
+        self.sent = []
+        self.closed = False
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout_values.append(timeout)
+
+    def recv(self, _size: int) -> bytes:
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeProcess:
     def __init__(self, pid: int = 4321) -> None:
         self.pid = pid
@@ -233,6 +258,122 @@ class MPVControllerIPCLockTests(unittest.TestCase):
 
         self.assertEqual(controller.last_loadfile_monotonic(), 654.25)
         self.assertEqual(ipc.write_calls, 1)
+
+    def test_default_query_config_keeps_persistent_ping_path(self) -> None:
+        ipc = ImmediateIPC()
+        controller = self.build_controller(ipc)
+        controller._ipc_socket = True
+
+        with mock.patch.object(controller, "_fresh_ipc_get_property") as fresh:
+            with mock.patch.object(controller, "_send", return_value={"error": "success"}) as send:
+                self.assertTrue(controller.ping())
+
+        fresh.assert_not_called()
+        send.assert_called_once()
+
+    def test_default_query_config_keeps_persistent_get_property_path(self) -> None:
+        ipc = ImmediateIPC()
+        controller = self.build_controller(ipc)
+
+        with mock.patch.object(controller, "_fresh_ipc_get_property") as fresh:
+            with mock.patch.object(
+                controller,
+                "_send",
+                return_value={"error": "success", "data": "value"},
+            ) as send:
+                self.assertEqual(controller.get_property("playlist-count"), "value")
+
+        fresh.assert_not_called()
+        send.assert_called_once()
+
+    def test_fresh_query_config_makes_ping_use_fresh_ipc(self) -> None:
+        cfg = controller_config()
+        cfg["mpv_query_uses_fresh_ipc"] = True
+        controller = kiosk.MPVController(cfg)
+
+        with mock.patch.object(
+            controller,
+            "_fresh_ipc_get_property",
+            return_value={"error": "success", "data": False},
+        ) as fresh:
+            with mock.patch.object(controller, "_send") as send:
+                self.assertTrue(controller.ping())
+
+        fresh.assert_called_once_with("idle-active", timeout=controller._ipc_timeout())
+        send.assert_not_called()
+
+    def test_fresh_query_config_makes_get_property_use_fresh_ipc(self) -> None:
+        cfg = controller_config()
+        cfg["mpv_query_uses_fresh_ipc"] = True
+        controller = kiosk.MPVController(cfg)
+
+        with mock.patch.object(
+            controller,
+            "_fresh_ipc_get_property",
+            return_value={"error": "success", "data": 3},
+        ) as fresh:
+            with mock.patch.object(controller, "_send") as send:
+                self.assertEqual(controller.get_property("playlist-count", timeout=0.3), 3)
+
+        fresh.assert_called_once_with("playlist-count", timeout=0.3)
+        send.assert_not_called()
+
+    def test_fresh_ipc_query_opens_sends_reads_and_closes_short_connection(self) -> None:
+        cfg = controller_config()
+        cfg["mpv_query_uses_fresh_ipc"] = True
+        controller = kiosk.MPVController(cfg)
+        sock = ChunkedSocket([b'{"request_id": 1, "error": "success", "data": true}\n'])
+
+        with mock.patch.object(controller, "_open_fresh_ipc", return_value=(sock, True)):
+            with self.assertLogs(level="INFO") as logs:
+                response = controller._fresh_ipc_get_property("idle-active", timeout=0.2)
+
+        self.assertEqual(response, {"request_id": 1, "error": "success", "data": True})
+        self.assertTrue(sock.closed)
+        self.assertIn(b'"request_id": 1', sock.sent[0])
+        log_text = "\n".join(logs.output)
+        self.assertIn("MPV IPC fresh query begin command=get_property", log_text)
+        self.assertNotIn("idle-active", log_text)
+
+    def test_recv_response_ignores_other_request_ids_until_expected_response(self) -> None:
+        controller = self.build_controller(ImmediateIPC())
+        controller._ipc_socket = True
+        controller._ipc = ChunkedSocket(
+            [
+                b'{"request_id": 99, "error": "success", "data": "wrong"}\n'
+                b'{"request_id": 7, "error": "success", "data": "expected"}\n'
+            ]
+        )
+
+        response = controller._recv_response(7, 0.2)
+
+        self.assertEqual(response["data"], "expected")
+        self.assertEqual(controller._recv_buffer, "")
+
+    def test_recv_response_timeout_logs_sanitized_counters(self) -> None:
+        controller = self.build_controller(ImmediateIPC())
+        controller._ipc_socket = True
+        controller._ipc = ChunkedSocket(
+            [
+                b'{"event": "secret-event-name"}\n'
+                b'not-json-secret-payload\n'
+            ]
+        )
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertIsNone(controller._recv_response(7, 0.2))
+
+        log_text = "\n".join(logs.output)
+        self.assertIn("MPV IPC response timeout", log_text)
+        self.assertIn("lines_read=2", log_text)
+        self.assertIn("events_without_request_id=1", log_text)
+        self.assertIn("responses_other_request_id=0", log_text)
+        self.assertIn("responses_expected_request_id=0", log_text)
+        self.assertIn("invalid_json_lines=1", log_text)
+        self.assertIn("buffer_before_bytes=0", log_text)
+        self.assertIn("buffer_after_bytes=0", log_text)
+        self.assertNotIn("secret-event-name", log_text)
+        self.assertNotIn("not-json-secret-payload", log_text)
 
 
 if __name__ == "__main__":

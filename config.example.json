@@ -27,6 +27,7 @@
   "mpv_ipc_timeout_sec": 2.0,
   "mpv_startup_timeout_sec": 10.0,
   "mpv_debug_events": false,
+  "mpv_query_uses_fresh_ipc": false,
   "ipc_path": "",
   "runtime_dir": "",
   "strict_paths_enabled": false,
