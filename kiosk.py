@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import calendar
+import html
 import hashlib
 import json
 import logging
@@ -105,6 +106,7 @@ DEFAULT_CONFIG = {
     "tmp_max_age_sec": 3600,
     "status_file": "",
     "status_interval_sec": 5,
+    "startup_feedback_enabled": True,
     "cleanup_interval_sec": 1800,
     "sync_enabled": True,
     "sync_drift_threshold_ms": 300,
@@ -801,6 +803,7 @@ class StatusState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._data: Dict[str, Optional[object]] = {
+            "status_schema_version": "kiosky-player-status.v2",
             "started_at": iso_now(),
             "last_poll_success": None,
             "last_poll_error": None,
@@ -822,7 +825,16 @@ class StatusState:
             "sync_next_checkpoint_utc": None,
             "sync_checkpoint_reason": None,
             "sync_cycle_ms": None,
-            "playback_state": "starting",
+            "player_state": "player_starting",
+            "playback_state": "player_starting",
+            "startup_phase": "player_starting",
+            "startup_feedback_state": "player_starting",
+            "startup_feedback_visible": False,
+            "startup_feedback_display": "none",
+            "startup_feedback_message": "Iniciando player",
+            "content_state": "unknown",
+            "first_frame_ready": False,
+            "first_content_load_accepted": False,
             "black_screen_risk_reason": None,
             "blocked_media_count": 0,
             "last_render_ok": None,
@@ -837,6 +849,132 @@ class StatusState:
     def snapshot(self) -> Dict[str, Optional[object]]:
         with self._lock:
             return dict(self._data)
+
+
+STARTUP_FEEDBACK_MESSAGES = {
+    "player_starting": ("Dadooh", "Iniciando player", "Aguarde alguns instantes."),
+    "waiting_for_api": ("Dadooh", "Carregando conteudo", "Buscando configuracao de midia."),
+    "waiting_for_playlist": ("Dadooh", "Carregando conteudo", "Preparando lista de midias."),
+    "waiting_for_media_cache": ("Dadooh", "Carregando conteudo", "Preparando midias locais."),
+    "waiting_for_media": ("Dadooh", "Carregando conteudo", "Aguardando midia disponivel."),
+    "waiting_for_content": ("Dadooh", "Carregando conteudo", "Preparando exibicao."),
+    "preparing_first_frame": ("Dadooh", "Carregando conteudo", "Abrindo primeira midia."),
+    "error_no_content": ("Dadooh", "Conteudo indisponivel", "O sistema tentara novamente."),
+    "error_player_start": ("Dadooh", "Player indisponivel", "O sistema tentara reiniciar."),
+}
+
+
+def public_startup_state(value: object) -> str:
+    state = str(value or "").strip().lower()
+    if state in STARTUP_FEEDBACK_MESSAGES or state == "playing":
+        return state
+    return "waiting_for_content"
+
+
+def update_waiting_status(
+    status: StatusState,
+    *,
+    startup_phase: str,
+    content_state: str,
+    playback_state: str = "waiting_for_content",
+    black_screen_risk_reason: Optional[str] = "waiting_for_content",
+) -> None:
+    snapshot = status.snapshot()
+    if snapshot.get("playback_state") == "playing" or snapshot.get("first_frame_ready") is True:
+        return
+    phase = public_startup_state(startup_phase)
+    status.update(
+        player_state=phase,
+        playback_state=playback_state,
+        startup_phase=phase,
+        startup_feedback_state=phase,
+        content_state=content_state,
+        first_frame_ready=False,
+        black_screen_risk_reason=black_screen_risk_reason,
+    )
+
+
+def startup_feedback_svg_path(cfg: Dict) -> str:
+    runtime_dir = cfg.get("runtime_dir") or default_runtime_dir()
+    return os.path.join(str(runtime_dir), "startup-feedback.svg")
+
+
+def build_startup_feedback_svg(state: str, *, width: int = 1280, height: int = 720) -> str:
+    safe_state = public_startup_state(state)
+    title, message, hint = STARTUP_FEEDBACK_MESSAGES.get(
+        safe_state, STARTUP_FEEDBACK_MESSAGES["waiting_for_content"]
+    )
+    escaped_state = html.escape(safe_state)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 1280 720" role="img" aria-label="Dadooh carregando conteudo">
+  <rect width="1280" height="720" fill="#101318"/>
+  <rect x="0" y="0" width="1280" height="10" fill="#22c55e"/>
+  <path d="M0 602 L1280 520 L1280 720 L0 720 Z" fill="#151923"/>
+  <text x="72" y="104" font-family="Arial, DejaVu Sans, sans-serif" font-size="42" font-weight="700" fill="#f8fafc">{html.escape(title)}</text>
+  <text x="72" y="218" font-family="Arial, DejaVu Sans, sans-serif" font-size="64" font-weight="700" fill="#f8fafc">{html.escape(message)}</text>
+  <text x="76" y="276" font-family="Arial, DejaVu Sans, sans-serif" font-size="28" fill="#cbd5e1">{html.escape(hint)}</text>
+  <rect x="76" y="344" width="392" height="54" rx="8" fill="#111827" stroke="#374151"/>
+  <text x="104" y="379" font-family="Arial, DejaVu Sans Mono, monospace" font-size="22" font-weight="700" fill="#86efac">STATUS: {escaped_state}</text>
+  <text x="76" y="646" font-family="Arial, DejaVu Sans, sans-serif" font-size="18" fill="#7d8796">Estado publico seguro. Nenhum dado privado exibido.</text>
+</svg>
+"""
+
+
+def write_startup_feedback_svg(cfg: Dict, state: str = "waiting_for_content") -> str:
+    target = startup_feedback_svg_path(cfg)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp_path = f"{target}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(build_startup_feedback_svg(state))
+    os.replace(tmp_path, target)
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    return target
+
+
+def show_startup_feedback(mpv: "MPVController", cfg: Dict, status: StatusState, state: str) -> bool:
+    if not cfg.get("startup_feedback_enabled", True):
+        return False
+    feedback_state = public_startup_state(state)
+    try:
+        path = write_startup_feedback_svg(cfg, feedback_state)
+        ok = mpv.load_file(path, alias=f"startup-feedback:{feedback_state}")
+    except Exception as exc:
+        logging.warning("Startup feedback render failed state=%s error=%s", feedback_state, exc)
+        status.update(
+            startup_feedback_visible=False,
+            startup_feedback_display="failed",
+            startup_feedback_state=feedback_state,
+        )
+        return False
+    status.update(
+        player_state=feedback_state,
+        playback_state="waiting_for_content",
+        startup_phase=feedback_state,
+        startup_feedback_state=feedback_state,
+        startup_feedback_visible=bool(ok),
+        startup_feedback_display="mpv_placeholder" if ok else "failed",
+        startup_feedback_message=STARTUP_FEEDBACK_MESSAGES[feedback_state][1],
+        content_state=feedback_state,
+        first_frame_ready=False,
+        first_content_load_accepted=False,
+        black_screen_risk_reason=None if ok else "startup_feedback_failed",
+    )
+    return bool(ok)
+
+
+def mark_player_error(status: StatusState, reason: str) -> None:
+    status.update(
+        player_state="error_player_start",
+        playback_state="error",
+        startup_phase="error_player_start",
+        startup_feedback_state="error_player_start",
+        content_state="error_no_content",
+        first_frame_ready=False,
+        black_screen_risk_reason=reason,
+    )
 
 
 def safe_getsize(path: str) -> Optional[int]:
@@ -2144,7 +2282,19 @@ def poller(
     while not stop_event.is_set():
         cfg_snapshot = config_snapshot(cfg, cfg_lock)
         try:
+            update_waiting_status(
+                status,
+                startup_phase="waiting_for_api",
+                content_state="waiting_for_api",
+                black_screen_risk_reason="api_playlist_wait",
+            )
             raw_items = fetch_media_list(cfg_snapshot)
+            update_waiting_status(
+                status,
+                startup_phase="waiting_for_playlist",
+                content_state="waiting_for_playlist",
+                black_screen_risk_reason="playlist_wait",
+            )
             if not raw_items and not cfg_snapshot.get("allow_empty_playlist_from_api", False):
                 current_items, _ = state.get()
                 if current_items:
@@ -2163,6 +2313,12 @@ def poller(
 
                 cache_items, cache_payload = media_items_from_cache(cfg_snapshot, cache_index)
                 if cache_items:
+                    update_waiting_status(
+                        status,
+                        startup_phase="waiting_for_media_cache",
+                        content_state="local_cache_ready",
+                        black_screen_risk_reason="media_cache_wait",
+                    )
                     cache_fp = fingerprint_items(cache_payload)
                     updated = state.update(cache_items, cache_fp)
                     if updated:
@@ -2183,6 +2339,12 @@ def poller(
                 raise RuntimeError("API returned empty playlist and no local media is available")
 
             fingerprint = fingerprint_items(raw_items)
+            update_waiting_status(
+                status,
+                startup_phase="waiting_for_media_cache",
+                content_state="downloading_or_validating_media",
+                black_screen_risk_reason="media_cache_wait",
+            )
             items = download_media(cfg_snapshot, raw_items, cache_index)
             switch_ok = True
             if cfg_snapshot.get("require_full_download_before_switch"):
@@ -2235,6 +2397,12 @@ def poller(
             backoff = 2
         except Exception as exc:
             logging.warning("API polling failed: %s", exc)
+            update_waiting_status(
+                status,
+                startup_phase="waiting_for_api",
+                content_state="api_error_retrying",
+                black_screen_risk_reason="api_playlist_wait",
+            )
             status.update(last_poll_error=f"{iso_now()} {exc}")
             consecutive_failures += 1
             status.update(consecutive_failures=consecutive_failures)
@@ -2489,6 +2657,32 @@ def telemetry_worker(
             time.sleep(0.2)
 
 
+def write_status_snapshot(status_path: str, status: StatusState) -> bool:
+    if not status_path:
+        return False
+    status_dir = os.path.dirname(status_path)
+    if status_dir:
+        os.makedirs(status_dir, exist_ok=True)
+    snapshot = status.snapshot()
+    snapshot["uptime_sec"] = int(time.time() - status.start_time)
+    tmp_path = f"{status_path}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, ensure_ascii=True)
+        os.replace(tmp_path, status_path)
+        return True
+    except Exception as exc:
+        logging.warning("Status write failed: %s", exc)
+        return False
+
+
+def write_status_once(cfg: Dict, status: StatusState) -> bool:
+    status_path = str(cfg.get("status_file") or "")
+    if not status_path:
+        return False
+    return write_status_snapshot(status_path, status)
+
+
 def status_writer(cfg: Dict, cfg_lock: threading.Lock, status: StatusState, stop_event: threading.Event) -> None:
     cfg_snapshot = config_snapshot(cfg, cfg_lock)
     if not cfg_snapshot.get("status_file"):
@@ -2501,15 +2695,7 @@ def status_writer(cfg: Dict, cfg_lock: threading.Lock, status: StatusState, stop
     if status_dir:
         os.makedirs(status_dir, exist_ok=True)
     while not stop_event.is_set():
-        snapshot = status.snapshot()
-        snapshot["uptime_sec"] = int(time.time() - status.start_time)
-        tmp_path = f"{status_path}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(snapshot, fh, ensure_ascii=True)
-            os.replace(tmp_path, status_path)
-        except Exception as exc:
-            logging.warning("Status write failed: %s", exc)
+        write_status_snapshot(status_path, status)
         for _ in range(int(interval * 5)):
             if stop_event.is_set():
                 break
@@ -2738,6 +2924,12 @@ def playback_loop(
         if not items:
             status.update(
                 playback_state="waiting_for_media",
+                player_state="waiting_for_media",
+                startup_phase="waiting_for_media",
+                startup_feedback_state="waiting_for_media",
+                startup_feedback_visible=bool(status.snapshot().get("startup_feedback_visible")),
+                content_state="waiting_for_playlist",
+                first_frame_ready=False,
                 black_screen_risk_reason="playlist_empty",
                 blocked_media_count=0,
             )
@@ -2748,6 +2940,11 @@ def playback_loop(
         if cycle_total_ms <= 0:
             status.update(
                 playback_state="waiting_for_media",
+                player_state="waiting_for_media",
+                startup_phase="waiting_for_media",
+                startup_feedback_state="waiting_for_media",
+                content_state="invalid_playlist_timeline",
+                first_frame_ready=False,
                 black_screen_risk_reason="invalid_playlist_timeline",
             )
             time.sleep(1)
@@ -2759,6 +2956,11 @@ def playback_loop(
         if blocked_count >= len(items):
             status.update(
                 playback_state="waiting_for_media",
+                player_state="waiting_for_media",
+                startup_phase="waiting_for_media",
+                startup_feedback_state="waiting_for_media",
+                content_state="all_media_temporarily_blocked",
+                first_frame_ready=False,
                 black_screen_risk_reason="all_media_temporarily_blocked",
                 blocked_media_count=blocked_count,
             )
@@ -2832,6 +3034,16 @@ def playback_loop(
         if not reuse_preloaded:
             item_alias = media_alias(item.path, item.url)
             load_context = media_load_log_context(item, idx % len(items), item_duration_ms, mpv)
+            status.update(
+                player_state="preparing_first_frame",
+                playback_state="preparing_first_frame",
+                startup_phase="preparing_first_frame",
+                startup_feedback_state="preparing_first_frame",
+                content_state="content_ready",
+                first_frame_ready=False,
+                first_content_load_accepted=False,
+                black_screen_risk_reason=None,
+            )
             if not mpv.load_file(item.path, alias=item_alias):
                 logging.warning("Failed to load media, restarting MPV: %s", load_context)
                 mpv.restart(reason=f"media_load_failed:{item_alias}")
@@ -2845,7 +3057,13 @@ def playback_loop(
                         cooldown_sec,
                     )
                     status.update(
+                        player_state="error_player_start",
                         playback_state="recovering",
+                        startup_phase="error_player_start",
+                        startup_feedback_state="error_player_start",
+                        content_state="media_load_failed",
+                        first_frame_ready=False,
+                        first_content_load_accepted=False,
                         black_screen_risk_reason="media_load_failed",
                         blocked_media_count=len(blocked_media_until),
                         last_render_error=f"{iso_now()} failed_to_load:{item.path}",
@@ -2865,7 +3083,15 @@ def playback_loop(
             mpv.append_file(next_item.path)
 
         status.update(
+            player_state="playing",
             playback_state="playing",
+            startup_phase="playing",
+            startup_feedback_state="playing",
+            startup_feedback_visible=False,
+            startup_feedback_display="player",
+            content_state="playing",
+            first_frame_ready=True,
+            first_content_load_accepted=True,
             black_screen_risk_reason=None,
             blocked_media_count=len(blocked_media_until),
             last_render_ok=iso_now(),
@@ -3044,6 +3270,12 @@ def main() -> int:
     stop_event = threading.Event()
     force_exit = threading.Event()
 
+    update_waiting_status(
+        status,
+        startup_phase="waiting_for_content",
+        content_state="checking_startup_content",
+        black_screen_risk_reason="waiting_for_content",
+    )
     if cfg.get("offline_fallback"):
         offline_network_available: Optional[bool] = None
         if (
@@ -3055,13 +3287,19 @@ def main() -> int:
                 logging.warning("API endpoint unavailable at boot; ignoring offline age limit for startup fallback.")
 
         loaded_offline = False
+        update_waiting_status(
+            status,
+            startup_phase="waiting_for_playlist",
+            content_state="checking_offline_playlist",
+            black_screen_risk_reason="playlist_wait",
+        )
         saved_items, _saved_fp, saved_at = load_playlist_state(cfg)
         if saved_items and offline_playlist_allowed(cfg, saved_at, offline_network_available):
             offline_items, fp_payload = media_items_from_saved(cfg, saved_items)
             if offline_items:
                 offline_fp = fingerprint_items(fp_payload)
                 state.update(offline_items, offline_fp)
-                status.update(playlist_size=len(offline_items))
+                status.update(playlist_size=len(offline_items), content_state="offline_playlist_ready")
                 logging.info("Loaded offline playlist: %d items", len(offline_items))
                 loaded_offline = True
             else:
@@ -3069,12 +3307,18 @@ def main() -> int:
         elif saved_items:
             logging.info("Offline playlist skipped due to max age policy.")
         if not loaded_offline and offline_playlist_allowed(cfg, None, offline_network_available):
+            update_waiting_status(
+                status,
+                startup_phase="waiting_for_media_cache",
+                content_state="checking_local_cache",
+                black_screen_risk_reason="media_cache_wait",
+            )
             cache_items, cache_payload = media_items_from_cache(cfg, cache_index)
             if cache_items:
                 cache_fp = fingerprint_items(cache_payload)
                 state.update(cache_items, cache_fp)
                 save_playlist_state(cfg, cache_items, cache_fp)
-                status.update(playlist_size=len(cache_items))
+                status.update(playlist_size=len(cache_items), content_state="local_cache_ready")
                 logging.info("Loaded offline playlist from local cache: %d items", len(cache_items))
 
     current_items, _current_version = state.get()
@@ -3083,6 +3327,7 @@ def main() -> int:
             logging.error("api_key/environment_id ausentes e nenhuma midia offline disponivel.")
         elif requests is None:
             logging.error("requests indisponivel e nenhuma midia offline disponivel.")
+        mark_player_error(status, "no_content")
         return 2
     if not api_polling_enabled:
         status.update(last_poll_error=f"{iso_now()} polling_disabled")
@@ -3110,7 +3355,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
 
+    status.update(
+        player_state="player_starting",
+        playback_state="player_starting",
+        startup_phase="player_starting",
+        startup_feedback_state="player_starting",
+        content_state="starting_mpv",
+    )
     mpv.start()
+    if not mpv.is_running():
+        mark_player_error(status, "mpv_start_failed")
+        write_status_once(cfg, status)
+        return 3
+    show_startup_feedback(mpv, cfg, status, "waiting_for_content")
+    write_status_once(cfg, status)
 
     threads: List[threading.Thread] = []
     if api_polling_enabled:
