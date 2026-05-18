@@ -129,6 +129,7 @@ class MediaItem:
     path: str
     campaign_id: str
     campaign_name: str
+    duration_source: str = "default"
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,49 @@ def effective_duration_ms(duration_ms: int) -> int:
     except Exception:
         parsed = 0
     return max(parsed, 1000)
+
+
+def _positive_int_ms(value: object) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _positive_seconds_to_ms(value: object) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    duration_ms = int(parsed * 1000)
+    if duration_ms <= 0:
+        return None
+    return duration_ms
+
+
+def resolve_exposure_duration_ms(item: Dict, default_duration_ms: int) -> Tuple[int, str]:
+    for field in ("exposure_time_ms", "exposureTimeMs"):
+        duration_ms = _positive_int_ms(item.get(field))
+        if duration_ms is not None:
+            return duration_ms, field
+
+    duration_ms = _positive_seconds_to_ms(item.get("exposureTimeSeconds"))
+    if duration_ms is not None:
+        return duration_ms, "exposureTimeSeconds"
+
+    default_ms = _positive_int_ms(default_duration_ms)
+    if default_ms is None:
+        default_ms = int(DEFAULT_CONFIG["default_duration_ms"])
+    return default_ms, "default"
 
 
 def cycle_timeline(items: List[MediaItem]) -> Tuple[List[int], List[int], int]:
@@ -495,6 +539,7 @@ def save_playlist_state(cfg: Dict, items: List["MediaItem"], fingerprint: str) -
             {
                 "url": item.url,
                 "duration_ms": item.duration_ms,
+                "duration_source": item.duration_source,
                 "path": item.path,
                 "campaign_id": item.campaign_id,
                 "campaign_name": item.campaign_name,
@@ -572,6 +617,7 @@ def media_items_from_saved(cfg: Dict, raw_items: List[Dict]) -> Tuple[List["Medi
                 path=resolved_path,
                 campaign_id=str(item.get("campaign_id", "")),
                 campaign_name=str(item.get("campaign_name", "")),
+                duration_source=str(item.get("duration_source", "default")),
             )
         )
         fingerprint_items_payload.append({"url": resolved_url, "duration_ms": duration_ms, "path": resolved_path})
@@ -650,6 +696,7 @@ def media_items_from_cache(
                 path=path,
                 campaign_id=campaign_id,
                 campaign_name=campaign_name,
+                duration_source=str(meta.get("duration_source", "default")),
             )
         )
         fingerprint_items_payload.append({"url": url, "duration_ms": duration_ms, "path": path})
@@ -1018,6 +1065,7 @@ class CacheIndex:
                 {
                     "url": item.url,
                     "duration_ms": item.duration_ms,
+                    "duration_source": item.duration_source,
                     "campaign_id": item.campaign_id,
                     "campaign_name": item.campaign_name,
                     "last_used": iso_now(),
@@ -1034,6 +1082,7 @@ class CacheIndex:
                 {
                     "url": item.url,
                     "duration_ms": item.duration_ms,
+                    "duration_source": item.duration_source,
                     "campaign_id": item.campaign_id,
                     "campaign_name": item.campaign_name,
                     "last_used": iso_now(),
@@ -1186,7 +1235,7 @@ def fetch_media_list(cfg: Dict) -> List[Dict]:
             status = str(campaign.get("status", "")).lower()
             if status and status not in {"ativa", "active"}:
                 continue
-            duration_ms = int(campaign.get("exposure_time_ms") or cfg["default_duration_ms"])
+            duration_ms, duration_source = resolve_exposure_duration_ms(campaign, int(cfg["default_duration_ms"]))
             urls = list(campaign.get("media_urls") or [])
             if not urls and campaign.get("primary_media_url"):
                 urls = [campaign["primary_media_url"]]
@@ -1197,6 +1246,7 @@ def fetch_media_list(cfg: Dict) -> List[Dict]:
                     {
                         "url": url,
                         "duration_ms": duration_ms,
+                        "duration_source": duration_source,
                         "campaign_id": str(campaign.get("id", "")),
                         "campaign_name": str(campaign.get("name", "")),
                     }
@@ -1266,6 +1316,7 @@ def download_media(cfg: Dict, raw_items: List[Dict], cache_index: Optional[Cache
             path=dest,
             campaign_id=item.get("campaign_id", ""),
             campaign_name=item.get("campaign_name", ""),
+            duration_source=str(item.get("duration_source", "default")),
         )
         items.append(media_item)
         if cache_index is not None:
@@ -3101,6 +3152,7 @@ def playback_loop(
                 "url": item.url,
                 "path": item.path,
                 "duration_ms": item_duration_ms,
+                "duration_source": item.duration_source,
                 "campaign_id": item.campaign_id,
                 "campaign_name": item.campaign_name,
                 "started_at": iso_now(),
@@ -3111,6 +3163,7 @@ def playback_loop(
                     "url": next_item.url,
                     "path": next_item.path,
                     "duration_ms": next_item.duration_ms,
+                    "duration_source": next_item.duration_source,
                     "campaign_id": next_item.campaign_id,
                     "campaign_name": next_item.campaign_name,
                 }

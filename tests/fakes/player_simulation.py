@@ -263,6 +263,7 @@ class PlayerTimingSimulator:
                 self._record(
                     "loop_suspected",
                     alias=alias,
+                    policy="repeat_to_fill_exposure",
                     reason="mpv_loop_file_repeats_short_video_within_exposure_window",
                     real_duration_ms=real_duration_ms,
                     exposure_window_ms=duration_ms,

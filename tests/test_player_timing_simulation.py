@@ -61,6 +61,7 @@ def item_from_cached(cache_dir: Path, url: str, duration_ms: int) -> kiosk.Media
         path=str(path),
         campaign_id="campaign-sim",
         campaign_name="Synthetic campaign",
+        duration_source="exposure_time_ms",
     )
 
 
@@ -76,6 +77,7 @@ class PlayerTimingSimulationTests(unittest.TestCase):
                 raw_items = kiosk.fetch_media_list(cfg)
 
             self.assertEqual(raw_items[0]["duration_ms"], 10000)
+            self.assertEqual(raw_items[0]["duration_source"], "exposure_time_ms")
             item = item_from_cached(cache_dir, url, int(raw_items[0]["duration_ms"]))
             simulator = PlayerTimingSimulator(cfg, [item], mpv=FakeMPV(), clock=FakeClock())
             events = simulator.run_steps(1)
@@ -102,6 +104,7 @@ class PlayerTimingSimulationTests(unittest.TestCase):
             self.assertIn("--loop-file=inf", kiosk.build_mpv_args(cfg))
             loop_events = [event for event in events if event.name == "loop_suspected"]
             self.assertEqual(len(loop_events), 1)
+            self.assertEqual(loop_events[0].fields["policy"], "repeat_to_fill_exposure")
             self.assertEqual(loop_events[0].fields["reason"], "mpv_loop_file_repeats_short_video_within_exposure_window")
             self.assertEqual(simulator.clock.monotonic(), 10.0)
 
@@ -116,16 +119,18 @@ class PlayerTimingSimulationTests(unittest.TestCase):
                 raw_items = kiosk.fetch_media_list(cfg)
 
             self.assertEqual(raw_items[0]["duration_ms"], cfg["default_duration_ms"])
+            self.assertEqual(raw_items[0]["duration_source"], "default")
 
-    def test_camel_case_duration_fields_are_ignored_by_current_parser(self) -> None:
+    def test_exposure_time_ms_has_priority_over_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_dir = Path(tmpdir)
-            url = "https://media.invalid/camel-case-duration.png"
+            url = "https://media.invalid/priority-duration.png"
             fake_api = FakeAPI(
                 playlist_payload(
                     [
                         campaign(
                             media_urls=[url],
+                            exposure_time_ms=9000,
                             exposureTimeMs=11000,
                             exposureTimeSeconds=12,
                             duration=13,
@@ -138,7 +143,100 @@ class PlayerTimingSimulationTests(unittest.TestCase):
             with patch.object(kiosk, "requests", fake_api):
                 raw_items = kiosk.fetch_media_list(cfg)
 
+            self.assertEqual(raw_items[0]["duration_ms"], 9000)
+            self.assertEqual(raw_items[0]["duration_source"], "exposure_time_ms")
+
+    def test_exposure_time_ms_default_does_not_override_api_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.invalid/api-value.png"
+            fake_api = FakeAPI(playlist_payload([campaign(media_urls=[url], exposure_time_ms=15000)]))
+            cfg = sim_cfg(cache_dir)
+            cfg["default_duration_ms"] = 7000
+
+            with patch.object(kiosk, "requests", fake_api):
+                raw_items = kiosk.fetch_media_list(cfg)
+
+            self.assertEqual(raw_items[0]["duration_ms"], 15000)
+            self.assertEqual(raw_items[0]["duration_source"], "exposure_time_ms")
+
+    def test_exposure_time_ms_alias_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.invalid/camel-case-duration.png"
+            fake_api = FakeAPI(playlist_payload([campaign(media_urls=[url], exposureTimeMs=11000)]))
+            cfg = sim_cfg(cache_dir)
+
+            with patch.object(kiosk, "requests", fake_api):
+                raw_items = kiosk.fetch_media_list(cfg)
+
+            self.assertEqual(raw_items[0]["duration_ms"], 11000)
+            self.assertEqual(raw_items[0]["duration_source"], "exposureTimeMs")
+
+    def test_duration_source_is_propagated_to_downloaded_media_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.invalid/source-propagation.png"
+            fake_api = FakeAPI(playlist_payload([campaign(media_urls=[url], exposureTimeMs=11000)]))
+            cfg = sim_cfg(cache_dir)
+            cache_index = kiosk.CacheIndex(cfg)
+
+            with patch.object(kiosk, "requests", fake_api):
+                raw_items = kiosk.fetch_media_list(cfg)
+                items = kiosk.download_media(cfg, raw_items, cache_index)
+
+            self.assertEqual(items[0].duration_source, "exposureTimeMs")
+            self.assertEqual(cache_index.snapshot()[items[0].path]["duration_source"], "exposureTimeMs")
+
+    def test_exposure_time_seconds_alias_is_converted_to_ms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.invalid/seconds-duration.png"
+            fake_api = FakeAPI(playlist_payload([campaign(media_urls=[url], exposureTimeSeconds=12)]))
+            cfg = sim_cfg(cache_dir)
+
+            with patch.object(kiosk, "requests", fake_api):
+                raw_items = kiosk.fetch_media_list(cfg)
+
+            self.assertEqual(raw_items[0]["duration_ms"], 12000)
+            self.assertEqual(raw_items[0]["duration_source"], "exposureTimeSeconds")
+
+    def test_invalid_duration_values_fall_back_to_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.invalid/invalid-duration.png"
+            fake_api = FakeAPI(
+                playlist_payload(
+                    [
+                        campaign(
+                            media_urls=[url],
+                            exposure_time_ms=0,
+                            exposureTimeMs=-1,
+                            exposureTimeSeconds="bad",
+                        )
+                    ]
+                )
+            )
+            cfg = sim_cfg(cache_dir)
+
+            with patch.object(kiosk, "requests", fake_api):
+                raw_items = kiosk.fetch_media_list(cfg)
+
             self.assertEqual(raw_items[0]["duration_ms"], cfg["default_duration_ms"])
+            self.assertEqual(raw_items[0]["duration_source"], "default")
+
+    def test_ambiguous_duration_field_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir)
+            url = "https://media.invalid/ambiguous-duration.png"
+            fake_api = FakeAPI(playlist_payload([campaign(media_urls=[url], duration=13)]))
+            cfg = sim_cfg(cache_dir)
+
+            with patch.object(kiosk, "requests", fake_api):
+                raw_items = kiosk.fetch_media_list(cfg)
+
+            self.assertEqual(raw_items[0]["duration_ms"], cfg["default_duration_ms"])
+            self.assertEqual(raw_items[0]["duration_source"], "default")
 
     def test_single_item_playlist_repeat_is_expected_cycle_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
