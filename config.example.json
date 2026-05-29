@@ -59,6 +59,8 @@
   "mpv_watchdog_grace_after_load_sec": 0,
   "mpv_watchdog_grace_after_restart_sec": 0,
   "media_load_retry_cooldown_sec": 60,
+  "mpv_load_soft_retries": 2,
+  "mpv_load_soft_retry_delay_sec": 0.3,
   "tmp_max_age_sec": 3600,
   "status_file": "",
   "status_interval_sec": 5,

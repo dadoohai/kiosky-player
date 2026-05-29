@@ -103,6 +103,8 @@ DEFAULT_CONFIG = {
     "mpv_watchdog_grace_after_load_sec": 0,
     "mpv_watchdog_grace_after_restart_sec": 0,
     "media_load_retry_cooldown_sec": 60,
+    "mpv_load_soft_retries": 2,
+    "mpv_load_soft_retry_delay_sec": 0.3,
     "tmp_max_age_sec": 3600,
     "status_file": "",
     "status_interval_sec": 5,
@@ -3096,33 +3098,52 @@ def playback_loop(
                 black_screen_risk_reason=None,
             )
             if not mpv.load_file(item.path, alias=item_alias):
-                logging.warning("Failed to load media, restarting MPV: %s", load_context)
-                mpv.restart(reason=f"media_load_failed:{item_alias}")
-                load_context = media_load_log_context(item, idx % len(items), item_duration_ms, mpv)
-                if not mpv.load_file(item.path, alias=item_alias):
-                    cooldown_sec = max(int(cfg_snapshot.get("media_load_retry_cooldown_sec") or 0), 5)
-                    blocked_media_until[item.path] = time.time() + cooldown_sec
-                    logging.warning(
-                        "Media load retry failed, entering cooldown: %s cooldown_sec=%d",
-                        load_context,
-                        cooldown_sec,
-                    )
-                    status.update(
-                        player_state="error_player_start",
-                        playback_state="recovering",
-                        startup_phase="error_player_start",
-                        startup_feedback_state="error_player_start",
-                        content_state="media_load_failed",
-                        first_frame_ready=False,
-                        first_content_load_accepted=False,
-                        black_screen_risk_reason="media_load_failed",
-                        blocked_media_count=len(blocked_media_until),
-                        last_render_error=f"{iso_now()} failed_to_load:{item.path}",
-                    )
-                    idx += 1
-                    offset_ms = 0
-                    time.sleep(0.2)
-                    continue
+                # A failed loadfile ACK is frequently a transient IPC hiccup on
+                # low-power hardware (the ack times out under momentary load),
+                # not a dead MPV. Re-send loadfile a few times -- cheap -- before
+                # paying for a full MPV restart, which the viewer perceives as a
+                # black flash and a reload/repeat of the current item.
+                soft_retries = positive_int_config(cfg_snapshot, "mpv_load_soft_retries")
+                soft_delay = positive_float_config(cfg_snapshot, "mpv_load_soft_retry_delay_sec", 0.3)
+                recovered = False
+                for soft_attempt in range(soft_retries):
+                    time.sleep(soft_delay)
+                    if mpv.is_running() and mpv.load_file(item.path, alias=item_alias):
+                        recovered = True
+                        logging.info(
+                            "Media load recovered without MPV restart: %s soft_attempt=%d",
+                            load_context,
+                            soft_attempt + 1,
+                        )
+                        break
+                if not recovered:
+                    logging.warning("Failed to load media, restarting MPV: %s", load_context)
+                    mpv.restart(reason=f"media_load_failed:{item_alias}")
+                    load_context = media_load_log_context(item, idx % len(items), item_duration_ms, mpv)
+                    if not mpv.load_file(item.path, alias=item_alias):
+                        cooldown_sec = max(int(cfg_snapshot.get("media_load_retry_cooldown_sec") or 0), 5)
+                        blocked_media_until[item.path] = time.time() + cooldown_sec
+                        logging.warning(
+                            "Media load retry failed, entering cooldown: %s cooldown_sec=%d",
+                            load_context,
+                            cooldown_sec,
+                        )
+                        status.update(
+                            player_state="error_player_start",
+                            playback_state="recovering",
+                            startup_phase="error_player_start",
+                            startup_feedback_state="error_player_start",
+                            content_state="media_load_failed",
+                            first_frame_ready=False,
+                            first_content_load_accepted=False,
+                            black_screen_risk_reason="media_load_failed",
+                            blocked_media_count=len(blocked_media_until),
+                            last_render_error=f"{iso_now()} failed_to_load:{item.path}",
+                        )
+                        idx += 1
+                        offset_ms = 0
+                        time.sleep(0.2)
+                        continue
             if offset_ms > 0 and not is_image_path(item.path):
                 offset_seconds = offset_ms / 1000.0
                 if not mpv.seek_absolute(offset_seconds):
