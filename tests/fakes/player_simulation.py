@@ -105,18 +105,10 @@ class FakeAPI:
 
 
 class FakeMPV:
-    def __init__(
-        self,
-        *,
-        fail_load_paths: Optional[Iterable[str]] = None,
-        transient_fail_counts: Optional[Dict[str, int]] = None,
-    ) -> None:
+    def __init__(self, *, fail_load_paths: Optional[Iterable[str]] = None) -> None:
         self.commands: List[Dict[str, object]] = []
         self.events: List[SimEvent] = []
         self.fail_load_paths = set(fail_load_paths or [])
-        # path -> number of upcoming load attempts that fail before succeeding
-        # (models a transient IPC ack hiccup that clears on a re-send).
-        self.transient_fail_counts: Dict[str, int] = dict(transient_fail_counts or {})
         self.restart_reasons: List[str] = []
         self._generation = 1
         self._running = True
@@ -149,12 +141,6 @@ class FakeMPV:
         self._last_loadfile_monotonic = 0.0
         if path in self.fail_load_paths:
             self.events.append(SimEvent("mpv_event_media_error", {"alias": alias or sanitized_media_id(path)}))
-            return False
-        if self.transient_fail_counts.get(path, 0) > 0:
-            self.transient_fail_counts[path] -= 1
-            self.events.append(
-                SimEvent("mpv_event_media_error", {"alias": alias or sanitized_media_id(path), "transient": True})
-            )
             return False
         self.events.append(SimEvent("mpv_event_file_loaded", {"alias": alias or sanitized_media_id(path)}))
         return True
@@ -261,22 +247,12 @@ class PlayerTimingSimulator:
             self._record("media_load_start", alias=alias)
             self.mpv.ensure_running()
             if not self.mpv.load_file(item.path, alias=alias):
-                # Soft-retry the loadfile (no MPV restart) to absorb transient
-                # IPC ack hiccups before escalating to a visible restart.
-                soft_retries = max(int(self.cfg.get("mpv_load_soft_retries", 2) or 0), 0)
-                recovered = False
-                for _ in range(soft_retries):
-                    if self.mpv.is_running() and self.mpv.load_file(item.path, alias=alias):
-                        recovered = True
-                        self._record("media_load_recovered_without_restart", alias=alias)
-                        break
-                if not recovered:
-                    self.mpv.restart(reason=f"media_load_failed:{alias}")
-                    if not self.mpv.load_file(item.path, alias=alias):
-                        self._record("media_load_done", alias=alias, ok=False)
-                        self._record("playback_error", alias=alias, behavior="advance_after_retry_failure")
-                        idx += 1
-                        continue
+                self.mpv.restart(reason=f"media_load_failed:{alias}")
+                if not self.mpv.load_file(item.path, alias=alias):
+                    self._record("media_load_done", alias=alias, ok=False)
+                    self._record("playback_error", alias=alias, behavior="advance_after_retry_failure")
+                    idx += 1
+                    continue
             self._record("mpv_loadfile_sent", alias=alias)
             self._record("mpv_event_file_loaded", alias=alias)
             self._record("playback_start", alias=alias, monotonic_ms=int(self.clock.monotonic() * 1000))

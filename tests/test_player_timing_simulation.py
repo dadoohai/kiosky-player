@@ -328,44 +328,6 @@ class PlayerTimingSimulationTests(unittest.TestCase):
             self.assertEqual(len(set(selected_aliases)), 2)
             self.assertTrue(mpv.restart_reasons)
 
-    def test_transient_load_failure_recovers_without_mpv_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache_dir = Path(tmpdir)
-            cfg = sim_cfg(cache_dir)
-            cfg["mpv_load_soft_retries"] = 2
-            first = item_from_cached(cache_dir, "https://media.invalid/a.mp4", 3000)
-            second = item_from_cached(cache_dir, "https://media.invalid/b.png", 4000)
-            # 'first' fails its initial loadfile ack once, then loads on re-send
-            # (a transient IPC hiccup, the common low-power-board case).
-            mpv = FakeMPV(transient_fail_counts={first.path: 1})
-            simulator = PlayerTimingSimulator(cfg, [first, second], mpv=mpv, clock=FakeClock())
-
-            events = simulator.run_steps(2)
-
-            self.assertTrue(
-                any(event.name == "media_load_recovered_without_restart" for event in events)
-            )
-            self.assertEqual(mpv.restart_reasons, [])  # no visible MPV restart
-            self.assertFalse(any(event.name == "playback_error" for event in events))
-            played = [event.fields["alias"] for event in events if event.name == "playback_start"]
-            self.assertEqual(len(played), 2)  # both items still played
-
-    def test_transient_load_failure_beyond_soft_retries_still_restarts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache_dir = Path(tmpdir)
-            cfg = sim_cfg(cache_dir)
-            cfg["mpv_load_soft_retries"] = 1
-            first = item_from_cached(cache_dir, "https://media.invalid/a.mp4", 3000)
-            second = item_from_cached(cache_dir, "https://media.invalid/b.png", 4000)
-            # fails more times than soft retries allow -> escalation to MPV restart
-            # is preserved (the watchdog safety net is not disabled).
-            mpv = FakeMPV(transient_fail_counts={first.path: 3})
-            simulator = PlayerTimingSimulator(cfg, [first, second], mpv=mpv, clock=FakeClock())
-
-            events = simulator.run_steps(2)
-
-            self.assertTrue(mpv.restart_reasons)  # escalation still fires
-
     def test_mpv_loop_flags_do_not_force_playlist_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg = sim_cfg(Path(tmpdir))
